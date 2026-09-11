@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import UTC, datetime
@@ -155,7 +156,11 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         "/api/findings/{finding_id}/decision",
         dependencies=[Depends(require_token)],
     )
-    def decide(finding_id: str, decision: ReviewDecision):
+    def decide(
+        finding_id: str,
+        decision: ReviewDecision,
+        x_review_token: str | None = Header(default=None),
+    ):
         finding = app.state.store.get_finding(finding_id)
         if not finding:
             raise HTTPException(status_code=404, detail="finding not found")
@@ -223,6 +228,15 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                     raise HTTPException(status_code=409, detail="finding state changed")
                 finding = latest
                 artifact_key = latest.approved_artifact_key
+        app.state.store.record_review(
+            finding_id=finding.finding_id,
+            action=finding.status.value,
+            note=decision.note,
+            reviewer=(
+                "sha256:" + hashlib.sha256(x_review_token.encode()).hexdigest()
+                if x_review_token else "reviewer"
+            ),
+        )
         log_event(
             "review_decision_recorded",
             run_id=finding.run_id,

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
-from agent.civic_canary.browser import AgentCoreBrowserAdapter
+from agent.civic_canary.browser import create_browser_adapter
 from agent.civic_canary.engine import CivicCanaryEngine, RunExecutionError
 from agent.civic_canary.models import (
     AgentInvocation,
@@ -52,7 +52,8 @@ def invoke(payload: dict) -> dict:
     )
     store = default_store()
     target = invocation.target
-    browser = AgentCoreBrowserAdapter(os.getenv("AWS_REGION", "us-east-1"))
+    browser_mode = os.getenv("BROWSER_MODE", "agentcore")
+    browser = create_browser_adapter(browser_mode)
     baseline = store.get_baseline(target.target_id)
     if baseline is None:
         baseline_target = target.model_copy(

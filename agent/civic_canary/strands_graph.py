@@ -57,12 +57,19 @@ def _all_complete(required_nodes: list[str]):
     return check
 
 
-def build_review_graph():
+def build_review_graph(model_id: str | None = None, region_name: str | None = None):
     """Build the bounded Strands review graph used for AWS semantic enrichment."""
+    resolved_model_id = model_id or os.getenv(
+        "BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    )
+    resolved_region = (
+        region_name
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    )
     model = BedrockModel(
-        model_id=os.getenv(
-            "BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0"
-        )
+        model_id=resolved_model_id,
+        region_name=resolved_region,
     )
     capture = Agent(
         name="capture_validator",

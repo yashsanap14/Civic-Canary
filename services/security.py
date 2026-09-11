@@ -27,7 +27,9 @@ class ReviewTokenVerifier:
         if not secret_arn:
             raise RuntimeError("REVIEW_TOKEN or REVIEW_TOKEN_SECRET_ARN must be configured")
         secret = boto3.client(
-            "secretsmanager", region_name=os.getenv("AWS_REGION", "us-east-1")
+            "secretsmanager",
+            region_name=os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         ).get_secret_value(SecretId=secret_arn)["SecretString"]
         if secret.startswith("sha256:") and re.fullmatch(r"[0-9a-f]{64}", secret[7:]):
             self._expected_digest = secret[7:]

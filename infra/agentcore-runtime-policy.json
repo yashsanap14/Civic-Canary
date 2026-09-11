@@ -15,7 +15,11 @@
         "dynamodb:PutItem",
         "dynamodb:Scan"
       ],
-      "Resource": "arn:aws:dynamodb:us-east-1:*:table/CivicCanaryMvp-*"
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:*:table/CivicCanarySites",
+        "arn:aws:dynamodb:us-east-1:*:table/CivicCanaryFindings",
+        "arn:aws:dynamodb:us-east-1:*:table/CivicCanaryReviews"
+      ]
     },
     {
       "Sid": "ReadAndWriteCivicCanaryEvidence",
@@ -24,7 +28,13 @@
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::civiccanarymvp-evidence*/*"
+      "Resource": "arn:aws:s3:::civic-canary/*"
+    },
+    {
+      "Sid": "ListRunHistory",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::civic-canary"
     },
     {
       "Sid": "UseManagedBrowser",

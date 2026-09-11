@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -94,6 +95,15 @@ class Store(ABC):
     def write_approved_artifact(self, finding: Finding) -> str: ...
 
     @abstractmethod
+    def record_review(
+        self,
+        finding_id: str,
+        action: str,
+        note: str = "",
+        reviewer: str = "reviewer",
+    ) -> str: ...
+
+    @abstractmethod
     def load_playbook(self, key: str) -> str: ...
 
     @abstractmethod
@@ -107,6 +117,7 @@ class InMemoryStore(Store):
         self.snapshots: dict[str, PortalSnapshot] = {}
         self.runs: dict[str, Run] = {}
         self.findings: dict[str, Finding] = {}
+        self.reviews: dict[str, dict[str, Any]] = {}
         self.artifacts: dict[str, str] = {}
         self.playbook = playbook
         self._lock = RLock()
@@ -198,6 +209,25 @@ class InMemoryStore(Store):
         self.artifacts[key] = content
         return key
 
+    def record_review(
+        self,
+        finding_id: str,
+        action: str,
+        note: str = "",
+        reviewer: str = "reviewer",
+    ) -> str:
+        with self._lock:
+            review_id = f"rev-{uuid.uuid4().hex[:12]}"
+            self.reviews[review_id] = {
+                "reviewId": review_id,
+                "findingId": finding_id,
+                "action": action,
+                "reviewedAt": datetime.now(UTC).isoformat(),
+                "reviewer": reviewer,
+                "notes": note,
+            }
+            return review_id
+
     def load_playbook(self, key: str) -> str:
         return self.playbook
 
@@ -206,50 +236,30 @@ class InMemoryStore(Store):
 
 
 class AwsStore(Store):
-    target_key = "target_id"
-    finding_key = "finding_id"
-
-    def _target_item(self, target: PortalTarget) -> dict:
-        item = _dynamo_item(target)
-        item[self.target_key] = item.pop("target_id")
-        return item
-
-    def _finding_item(self, finding: Finding) -> dict:
-        item = _dynamo_item(finding)
-        item[self.finding_key] = item.pop("finding_id")
-        return item
-
-    def _target_model(self, item: dict) -> PortalTarget:
-        return PortalTarget.model_validate(
-            {**_from_dynamo(item), "target_id": item[self.target_key]}
-        )
-
-    def _finding_model(self, item: dict) -> Finding:
-        return Finding.model_validate(
-            {**_from_dynamo(item), "finding_id": item[self.finding_key]}
-        )
-
     def __init__(
         self,
-        *,
-        targets_table: str,
-        runs_table: str,
+        sites_table: str,
         findings_table: str,
+        reviews_table: str,
         evidence_bucket: str,
         region: str = "us-east-1",
     ) -> None:
         dynamodb = boto3.resource("dynamodb", region_name=region)
-        self.targets = dynamodb.Table(targets_table)
-        self.runs = dynamodb.Table(runs_table)
+        self.sites = dynamodb.Table(sites_table)
         self.findings = dynamodb.Table(findings_table)
+        self.reviews = dynamodb.Table(reviews_table)
         self.s3 = boto3.client("s3", region_name=region)
         self.bucket = evidence_bucket
+        self.region = region
 
     def get_target(self, target_id: str) -> PortalTarget | None:
-        item = self.targets.get_item(
-            Key={self.target_key: target_id}, ConsistentRead=True
-        ).get("Item")
-        return self._target_model(item) if item else None
+        item = self.sites.get_item(Key={"siteId": target_id}).get("Item")
+        if not item:
+            return None
+        data = _from_dynamo(item)
+        if "siteId" in data:
+            data["target_id"] = data.pop("siteId")
+        return PortalTarget.model_validate(data)
 
     @staticmethod
     def _scan_all(table) -> list[dict[str, Any]]:
@@ -264,13 +274,18 @@ class AwsStore(Store):
             options["ExclusiveStartKey"] = last_key
 
     def list_targets(self) -> list[PortalTarget]:
-        return [
-            self._target_model(item)
-            for item in self._scan_all(self.targets)
-        ]
+        targets: list[PortalTarget] = []
+        for item in self._scan_all(self.sites):
+            data = _from_dynamo(item)
+            if "siteId" in data:
+                data["target_id"] = data.pop("siteId")
+            targets.append(PortalTarget.model_validate(data))
+        return targets
 
     def put_target(self, target: PortalTarget) -> None:
-        self.targets.put_item(Item=self._target_item(target))
+        item = _dynamo_item(target)
+        item["siteId"] = item.pop("target_id")
+        self.sites.put_item(Item=item)
 
     def get_baseline(self, target_id: str) -> PortalSnapshot | None:
         try:
@@ -298,39 +313,67 @@ class AwsStore(Store):
         )
 
     def put_run(self, run: Run) -> None:
-        self.runs.put_item(Item=_dynamo_item(run))
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=f"runs/{run.run_id}.json",
+            Body=run.model_dump_json(indent=2).encode(),
+            ContentType="application/json",
+        )
 
     def create_run(self, run: Run) -> bool:
         try:
-            self.runs.put_item(
-                Item=_dynamo_item(run),
-                ConditionExpression="attribute_not_exists(run_id)",
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=f"runs/{run.run_id}.json",
+                Body=run.model_dump_json(indent=2).encode(),
+                ContentType="application/json",
+                IfNoneMatch="*",
             )
             return True
         except ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            if exc.response["Error"]["Code"] in {"PreconditionFailed", "412"}:
                 return False
             raise
 
     def get_run(self, run_id: str) -> Run | None:
-        item = self.runs.get_item(Key={"run_id": run_id}).get("Item")
-        return Run.model_validate(_from_dynamo(item)) if item else None
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=f"runs/{run_id}.json")
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+                return None
+            raise
+        return Run.model_validate_json(response["Body"].read())
 
     def list_runs(self) -> list[Run]:
+        runs: list[Run] = []
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix="runs/"):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key", "")
+                if not key.endswith(".json"):
+                    continue
+                try:
+                    resp = self.s3.get_object(Bucket=self.bucket, Key=key)
+                    runs.append(Run.model_validate_json(resp["Body"].read()))
+                except ClientError as exc:
+                    if exc.response["Error"]["Code"] not in {"NoSuchKey", "404"}:
+                        raise
         return sorted(
-            [Run.model_validate(_from_dynamo(item)) for item in self._scan_all(self.runs)],
+            runs,
             key=lambda run: run.started_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
 
     def put_finding(self, finding: Finding) -> bool:
+        item = _dynamo_item(finding)
+        item["findingId"] = item.pop("finding_id")
         if finding.status != "OPEN":
-            self.findings.put_item(Item=self._finding_item(finding))
+            self.findings.put_item(Item=item)
             return True
         try:
             self.findings.put_item(
-                Item=self._finding_item(finding),
-                ConditionExpression=f"attribute_not_exists({self.finding_key})",
+                Item=item,
+                ConditionExpression="attribute_not_exists(findingId)",
             )
             return True
         except ClientError as exc:
@@ -339,19 +382,24 @@ class AwsStore(Store):
             raise
 
     def get_finding(self, finding_id: str) -> Finding | None:
-        item = self.findings.get_item(
-            Key={self.finding_key: finding_id}, ConsistentRead=True
-        ).get("Item")
-        return self._finding_model(item) if item else None
+        item = self.findings.get_item(Key={"findingId": finding_id}).get("Item")
+        if not item:
+            return None
+        data = _from_dynamo(item)
+        if "findingId" in data:
+            data["finding_id"] = data.pop("findingId")
+        return Finding.model_validate(data)
 
     def transition_finding(
         self,
         finding: Finding,
         expected_status: FindingStatus,
     ) -> bool:
+        item = _dynamo_item(finding)
+        item["findingId"] = item.pop("finding_id")
         try:
             self.findings.put_item(
-                Item=self._finding_item(finding),
+                Item=item,
                 ConditionExpression="#finding_status = :expected",
                 ExpressionAttributeNames={"#finding_status": "status"},
                 ExpressionAttributeValues={":expected": expected_status.value},
@@ -363,11 +411,14 @@ class AwsStore(Store):
             raise
 
     def list_findings(self) -> list[Finding]:
+        findings: list[Finding] = []
+        for item in self._scan_all(self.findings):
+            data = _from_dynamo(item)
+            if "findingId" in data:
+                data["finding_id"] = data.pop("findingId")
+            findings.append(Finding.model_validate(data))
         return sorted(
-            [
-                self._finding_model(item)
-                for item in self._scan_all(self.findings)
-            ],
+            findings,
             key=lambda finding: finding.created_at,
             reverse=True,
         )
@@ -382,6 +433,25 @@ class AwsStore(Store):
             Bucket=self.bucket, Key=key, Body=content.encode(), ContentType="text/markdown"
         )
         return key
+
+    def record_review(
+        self,
+        finding_id: str,
+        action: str,
+        note: str = "",
+        reviewer: str = "reviewer",
+    ) -> str:
+        review_id = f"rev-{uuid.uuid4().hex[:12]}"
+        item = {
+            "reviewId": review_id,
+            "findingId": finding_id,
+            "action": action,
+            "reviewedAt": datetime.now(UTC).isoformat(),
+            "reviewer": reviewer,
+            "notes": note,
+        }
+        self.reviews.put_item(Item=_to_dynamo(item))
+        return review_id
 
     def load_playbook(self, key: str) -> str:
         response = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -416,12 +486,37 @@ class ExistingAwsStore(AwsStore):
     ) -> None:
         dynamodb = boto3.resource("dynamodb", region_name=region)
         self.targets = dynamodb.Table(sites_table)
+        self.sites = self.targets
         self.findings = dynamodb.Table(findings_table)
         self.reviews = dynamodb.Table(reviews_table)
         # A separate low-level client avoids DynamoDB resource double serialization.
         self.ddb = boto3.client("dynamodb", region_name=region)
         self.s3 = boto3.client("s3", region_name=region)
         self.bucket = evidence_bucket
+
+    def _target_item(self, target: PortalTarget) -> dict:
+        item = _dynamo_item(target)
+        item["siteId"] = item.pop("target_id")
+        return item
+
+    def _finding_item(self, finding: Finding) -> dict:
+        item = _dynamo_item(finding)
+        item["findingId"] = item.pop("finding_id")
+        return item
+
+    def get_target(self, target_id: str) -> PortalTarget | None:
+        item = self.sites.get_item(
+            Key={"siteId": target_id}, ConsistentRead=True
+        ).get("Item")
+        return PortalTarget.model_validate(
+            {**_from_dynamo(item), "target_id": item["siteId"]}
+        ) if item else None
+
+    def record_review(
+        self, finding_id: str, action: str, note: str = "", reviewer: str = "reviewer"
+    ) -> str:
+        # The API calls this after transition_finding; the transaction already saved it.
+        return f"review-{finding_id}"
 
     @staticmethod
     def _run_key(run_id: str) -> str:

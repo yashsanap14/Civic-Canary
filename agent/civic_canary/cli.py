@@ -5,7 +5,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from .browser import FixtureBrowserAdapter
+from .browser import create_browser_adapter
 from .engine import CivicCanaryEngine
 from .models import PortalTarget
 
@@ -14,8 +14,8 @@ FIXTURES = PROJECT_ROOT / "web" / "public" / "portal"
 PLAYBOOK = PROJECT_ROOT / "agent" / "fixtures" / "benefits-playbook.md"
 
 
-async def _scan(version: str) -> dict:
-    browser = FixtureBrowserAdapter(FIXTURES)
+async def _scan(version: str, browser_mode: str | None = None) -> dict:
+    browser = create_browser_adapter(browser_mode, fixture_root=FIXTURES)
     target = PortalTarget(active_version="v1")
     baseline = await browser.capture(target, "baseline-v1")
     target.active_version = version
@@ -34,10 +34,17 @@ async def _scan(version: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Civic Canary deterministic demo scan")
     parser.add_argument("--version", choices=["v1", "v2"], default="v2")
+    parser.add_argument(
+        "--browser-mode",
+        choices=["local", "agentcore"],
+        default=None,
+        help="Browser mode (defaults to BROWSER_MODE env var or 'local')",
+    )
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(_scan(args.version)), indent=2))
+    print(json.dumps(asyncio.run(_scan(args.version, args.browser_mode)), indent=2))
 
 
 if __name__ == "__main__":
     main()
+
 

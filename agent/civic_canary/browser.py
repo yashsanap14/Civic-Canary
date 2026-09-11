@@ -285,8 +285,19 @@ class HttpBrowserAdapter(BrowserAdapter):
 class AgentCoreBrowserAdapter(BrowserAdapter):
     """Managed-browser implementation used inside AgentCore/AWS mode."""
 
-    def __init__(self, region: str = "us-east-1") -> None:
-        self.region = region
+    def __init__(
+        self,
+        region: str | None = None,
+        identifier: str | None = None,
+    ) -> None:
+        self.region = (
+            region
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        )
+        self.identifier = identifier or os.getenv("AGENTCORE_BROWSER_ID")
+        if not self.identifier:
+            raise ValueError("AGENTCORE_BROWSER_ID is required when BROWSER_MODE=agentcore")
 
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target)
@@ -304,7 +315,7 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
             raise RuntimeError("bundled axe-core script is missing from the runtime")
         axe_source = axe_path.read_text(encoding="utf-8")
         with browser_session(
-            self.region, identifier=os.getenv("AGENTCORE_BROWSER_ID")
+            self.region, identifier=self.identifier
         ) as client, sync_playwright() as playwright:
             ws_url, headers = client.generate_ws_headers()
             browser = playwright.chromium.connect_over_cdp(ws_url, headers=headers)
@@ -402,7 +413,7 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                         else f"screenshots/{target.target_id}/{run_id}"
                     )
                     page_screenshot_key = f"{screenshot_prefix}/{index + 1}-{slug}.png"
-                    bucket = os.getenv("EVIDENCE_BUCKET")
+                    bucket = os.getenv("EVIDENCE_BUCKET") or os.getenv("CIVIC_CANARY_S3_BUCKET")
                     if bucket:
                         boto3.client("s3", region_name=self.region).put_object(
                             Bucket=bucket,
@@ -424,3 +435,37 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
             content_hash=_snapshot_hash(pages),
             screenshot_key=screenshot_key,
         )
+
+
+def create_browser_adapter(
+    mode: str | None = None,
+    *,
+    fixture_root: Path | None = None,
+    region: str | None = None,
+    identifier: str | None = None,
+) -> BrowserAdapter:
+    """Create a browser adapter based on mode (or BROWSER_MODE env var)."""
+    selected_mode = (mode or os.getenv("BROWSER_MODE", "local")).lower()
+    if selected_mode == "agentcore":
+        resolved_identifier = identifier or os.getenv("AGENTCORE_BROWSER_ID")
+        if not resolved_identifier:
+            raise ValueError("AGENTCORE_BROWSER_ID is required when BROWSER_MODE=agentcore")
+        resolved_region = (
+            region
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        )
+        return AgentCoreBrowserAdapter(
+            region=resolved_region, identifier=resolved_identifier
+        )
+    if selected_mode == "local":
+        root = (
+            fixture_root
+            or (Path(__file__).resolve().parents[2] / "web" / "public" / "portal")
+        )
+        return FixtureBrowserAdapter(root)
+    if selected_mode == "http":
+        return HttpBrowserAdapter()
+    raise ValueError(
+        f"Unsupported BROWSER_MODE: {selected_mode!r}. Expected 'local' or 'agentcore'."
+    )

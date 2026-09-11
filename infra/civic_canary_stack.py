@@ -58,30 +58,10 @@ class CivicCanaryStack(Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        evidence = s3.Bucket(
-            self,
-            "Evidence",
-            encryption=s3.BucketEncryption.S3_MANAGED,
-            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-            enforce_ssl=True,
-            versioned=True,
-            removal_policy=RemovalPolicy.DESTROY,
-            auto_delete_objects=True,
-            lifecycle_rules=[
-                s3.LifecycleRule(
-                    prefix="snapshots/",
-                    expiration=Duration.days(30),
-                    noncurrent_version_expiration=Duration.days(7),
-                ),
-                s3.LifecycleRule(prefix="screenshots/", expiration=Duration.days(30)),
-                s3.LifecycleRule(
-                    prefix="browser-recordings/", expiration=Duration.days(30)
-                ),
-            ],
-        )
-        targets = self._table("Targets", "target_id")
-        runs = self._table("Runs", "run_id")
-        findings = self._table("Findings", "finding_id")
+        evidence = s3.Bucket.from_bucket_name(self, "Evidence", "civic-canary")
+        sites = dynamodb.Table.from_table_name(self, "Sites", "CivicCanarySites")
+        findings = dynamodb.Table.from_table_name(self, "Findings", "CivicCanaryFindings")
+        reviews = dynamodb.Table.from_table_name(self, "Reviews", "CivicCanaryReviews")
         review_secret = secretsmanager.Secret(
             self,
             "ReviewToken",
@@ -154,8 +134,8 @@ class CivicCanaryStack(Stack):
             parameter_name="/civic-canary/storage-config",
             string_value=self.to_json_string(
                 {
-                    "targets_table": targets.table_name,
-                    "runs_table": runs.table_name,
+                    "sites_table": sites.table_name,
+                    "reviews_table": reviews.table_name,
                     "findings_table": findings.table_name,
                     "evidence_bucket": evidence.bucket_name,
                     "browser_id": managed_browser.attr_browser_id,
@@ -168,10 +148,10 @@ class CivicCanaryStack(Stack):
         common_environment = {
             "AWS_REGION_NAME": self.region,
             "CIVIC_CANARY_MODE": "aws",
-            "TARGETS_TABLE": targets.table_name,
-            "RUNS_TABLE": runs.table_name,
-            "FINDINGS_TABLE": findings.table_name,
-            "EVIDENCE_BUCKET": evidence.bucket_name,
+            "CIVIC_CANARY_SITES_TABLE": sites.table_name,
+            "CIVIC_CANARY_REVIEWS_TABLE": reviews.table_name,
+            "CIVIC_CANARY_FINDINGS_TABLE": findings.table_name,
+            "CIVIC_CANARY_S3_BUCKET": evidence.bucket_name,
             "REVIEW_TOKEN_SECRET_ARN": review_secret.secret_arn,
             "AGENT_RUNTIME_SSM_PARAMETER": runtime_parameter.parameter_name,
         }
@@ -211,8 +191,8 @@ class CivicCanaryStack(Stack):
         )
 
         for function in (api_function, schedule_function):
-            targets.grant_read_write_data(function)
-            runs.grant_read_write_data(function)
+            sites.grant_read_write_data(function)
+            reviews.grant_read_write_data(function)
             findings.grant_read_write_data(function)
             evidence.grant_read_write(function)
             review_secret.grant_read(function)
@@ -272,25 +252,11 @@ class CivicCanaryStack(Stack):
             value=api.api_endpoint,
         )
         CfnOutput(self, "EvidenceBucket", value=evidence.bucket_name)
-        CfnOutput(self, "TargetsTable", value=targets.table_name)
-        CfnOutput(self, "RunsTable", value=runs.table_name)
+        CfnOutput(self, "SitesTable", value=sites.table_name)
+        CfnOutput(self, "ReviewsTable", value=reviews.table_name)
         CfnOutput(self, "FindingsTable", value=findings.table_name)
         CfnOutput(self, "ReviewTokenSecretArn", value=review_secret.secret_arn)
         CfnOutput(self, "AgentRuntimeParameter", value=runtime_parameter.parameter_name)
         CfnOutput(self, "StorageConfigParameter", value=storage_parameter.parameter_name)
         CfnOutput(self, "ManagedBrowserId", value=managed_browser.attr_browser_id)
 
-    def _table(self, construct_id: str, partition_key: str) -> dynamodb.Table:
-        return dynamodb.Table(
-            self,
-            construct_id,
-            partition_key=dynamodb.Attribute(
-                name=partition_key, type=dynamodb.AttributeType.STRING
-            ),
-            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-            encryption=dynamodb.TableEncryption.AWS_MANAGED,
-            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
-                point_in_time_recovery_enabled=True
-            ),
-            removal_policy=RemovalPolicy.DESTROY,
-        )

@@ -32,9 +32,9 @@ def seed(stack_name: str, region: str) -> None:
         active_version="v1",
     )
     dynamodb = boto3.resource("dynamodb", region_name=region)
-    dynamodb.Table(outputs["TargetsTable"]).put_item(
-        Item=json.loads(target.model_dump_json())
-    )
+    item = json.loads(target.model_dump_json())
+    item["siteId"] = item.pop("target_id")
+    dynamodb.Table(outputs["SitesTable"]).put_item(Item=item)
 
     s3 = boto3.client("s3", region_name=region)
     s3.put_object(

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import boto3
 
-from agent.civic_canary.browser import FixtureBrowserAdapter
+from agent.civic_canary.browser import BrowserAdapter, create_browser_adapter
 from agent.civic_canary.engine import CivicCanaryEngine, RunExecutionError
 from agent.civic_canary.models import Finding, PortalTarget, Run, RunStatus, TriggerType
 from services.observability import log_event
@@ -17,10 +17,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = PROJECT_ROOT / "web" / "public" / "portal"
 
 
+def _aws_region() -> str:
+    return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+
 class ScanService:
-    def __init__(self, store: Store, browser: FixtureBrowserAdapter | None = None) -> None:
+    def __init__(self, store: Store, browser: BrowserAdapter | None = None) -> None:
         self.store = store
-        self.browser = browser or FixtureBrowserAdapter(FIXTURES)
+        self.browser = browser or create_browser_adapter(fixture_root=FIXTURES)
 
     async def run_local(
         self,
@@ -79,7 +83,7 @@ class ScanService:
         if not parameter:
             return None
         value = boto3.client(
-            "ssm", region_name=os.getenv("AWS_REGION", "us-east-1")
+            "ssm", region_name=_aws_region()
         ).get_parameter(Name=parameter)["Parameter"]["Value"]
         return None if value == "UNCONFIGURED" else value
 
@@ -87,7 +91,7 @@ class ScanService:
         arn = self.agentcore_arn()
         if not arn:
             raise RuntimeError("AgentCore runtime ARN is not configured")
-        client = boto3.client("bedrock-agentcore", region_name=os.getenv("AWS_REGION", "us-east-1"))
+        client = boto3.client("bedrock-agentcore", region_name=_aws_region())
         runtime_session_id = f"civic-canary-{run_id}-{uuid.uuid4().hex[:8]}"
         log_event(
             "agentcore_invocation_started",
@@ -135,7 +139,7 @@ class ScanService:
             return existing
         try:
             response = boto3.client(
-                "lambda", region_name=os.getenv("AWS_REGION", "us-east-1")
+                "lambda", region_name=_aws_region()
             ).invoke(
                 FunctionName=worker,
                 InvocationType="Event",
@@ -162,3 +166,4 @@ class ScanService:
             trigger_type=trigger.value,
         )
         return run
+

@@ -123,6 +123,28 @@ uv run civic-canary --version v2
 V1 should produce no findings. V2 should detect the document requirement, broken Spanish link,
 and unlabeled field.
 
+## Run with Amazon Bedrock AgentCore Browser
+
+To run Civic Canary using the managed Amazon Bedrock AgentCore Browser rather than the local fixture browser, create or update your local `.env` file with:
+
+```bash
+AWS_REGION=us-east-1
+BROWSER_MODE=agentcore
+AGENTCORE_BROWSER_ID=<their-browser-tool-id>
+BEDROCK_MODEL_ID=<their-bedrock-model-or-inference-profile-id>
+```
+
+AWS credentials should come from the normal AWS credential chain / IAM role (such as `aws sso login` or environment credentials) and must not be committed to GitHub.
+
+Run the scan locally in AgentCore mode:
+
+```bash
+uv run civic-canary --version v2 --browser-mode agentcore
+```
+
+When `BROWSER_MODE=agentcore` is set in `.env`, `uv run civic-canary --version v2` automatically connects to the configured AgentCore Browser tool.
+
+
 ## Tests and quality checks
 
 ```bash
@@ -181,3 +203,74 @@ CDK output, packaged ZIP files, or local AgentCore state. These are excluded by 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Existing AWS storage and EC2 redeployment
+
+The AWS store uses existing tables; it does not create tables or buckets. Configure:
+
+```dotenv
+CIVIC_CANARY_MODE=aws
+AWS_REGION=us-east-1
+CIVIC_CANARY_SITES_TABLE=CivicCanarySites
+CIVIC_CANARY_FINDINGS_TABLE=CivicCanaryFindings
+CIVIC_CANARY_REVIEWS_TABLE=CivicCanaryReviews
+CIVIC_CANARY_S3_BUCKET=civic-canary
+```
+
+Site and finding partition keys are `siteId` and `findingId`. Domain models and API
+responses retain `target_id` and `finding_id`. Reviews use `reviewId`, `findingId`,
+`action` (APPROVED/REJECTED), `reviewedAt`, `reviewer`, and `notes`. The API records a
+SHA-256 token identity rather than the raw reviewer token.
+
+Runs persist at `s3://civic-canary/runs/{run_id}.json`; Recent Runs lists these objects
+across all pages and sorts newest first. Conditional S3 writes prevent duplicate run
+creation. Existing `baselines/`, `snapshots/`, `evidence/`, and `approved/` storage
+behavior is preserved. Local mode still uses InMemoryStore.
+
+Remove legacy targets/runs table variables. If using `/civic-canary/storage-config`
+in SSM, update its keys to `sites_table`, `findings_table`, `reviews_table`, and
+`evidence_bucket`; old targets/runs keys are ignored. Explicit environment values take
+precedence. The EC2 instance role needs DynamoDB GetItem, PutItem, Scan on the three
+tables, S3 GetObject/PutObject on `civic-canary/*`, and S3 ListBucket on `civic-canary`.
+See `infra/agentcore-runtime-policy.json` for the storage permissions.
+
+Migration: existing records with the required camelCase keys need no key migration;
+they must still contain the domain model's other required fields. Redundant legacy
+ID attributes are ignored in favor of the partition key and removed on the next write.
+Data in older tables or buckets is not copied automatically. Export old run models to
+`runs/{run_id}.json` in the existing bucket if that history must remain visible. Copy
+old baseline/evidence objects preserving their paths if moving from another bucket.
+No AWS resources or stored data were modified by this code change.
+
+The CDK stack now imports the existing resources. **If upgrading a previously deployed
+CDK stack, first retain and back up its old storage resources before removing them
+from CloudFormation**: the old definitions used DESTROY and S3 auto-delete. Review
+`cdk diff` before deployment. EC2 code redeployment does not require CDK deployment.
+
+On EC2, after committing and pushing this change, use the following commands. Replace
+`/path/to/Civic-Canary` and `civic-canary.service` with your checkout and existing
+systemd unit (the repository does not define an EC2 unit):
+
+```bash
+cd /path/to/Civic-Canary
+git pull --ff-only
+# Edit .env with the values above; retain your reviewer/browser/model settings.
+nano .env
+uv sync --extra dev
+npm --prefix web ci
+npm --prefix web run build
+uv run --extra dev pytest -q
+# The systemd unit must load this checkout's .env via EnvironmentFile.
+sudo systemctl restart civic-canary.service
+sudo systemctl status civic-canary.service --no-pager
+curl --fail http://127.0.0.1:8000/api/health
+```
+
+For a foreground deployment without systemd, start the API with the environment loaded:
+
+```bash
+set -a
+source .env
+set +a
+uv run uvicorn services.control_api.app:app --host 0.0.0.0 --port 8000
+```
