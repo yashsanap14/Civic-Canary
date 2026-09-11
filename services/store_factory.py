@@ -6,7 +6,7 @@ from pathlib import Path
 
 import boto3
 
-from services.storage import AwsStore, InMemoryStore, Store
+from services.storage import AwsStore, ExistingAwsStore, InMemoryStore, Store
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PLAYBOOK = PROJECT_ROOT / "agent" / "fixtures" / "benefits-playbook.md"
@@ -15,6 +15,14 @@ PLAYBOOK = PROJECT_ROOT / "agent" / "fixtures" / "benefits-playbook.md"
 def default_store() -> Store:
     if os.getenv("CIVIC_CANARY_MODE", "local") == "aws":
         region = os.getenv("AWS_REGION", "us-east-1")
+        if os.getenv("AWS_STORAGE_LAYOUT") == "existing":
+            return ExistingAwsStore(
+                sites_table=os.getenv("SITES_TABLE", "CivicCanarySites"),
+                findings_table=os.getenv("FINDINGS_TABLE", "CivicCanaryFindings"),
+                reviews_table=os.getenv("REVIEWS_TABLE", "CivicCanaryReviews"),
+                evidence_bucket=os.getenv("EVIDENCE_BUCKET", "civic-canary"),
+                region=region,
+            )
         config = {
             "targets_table": os.getenv("TARGETS_TABLE"),
             "runs_table": os.getenv("RUNS_TABLE"),

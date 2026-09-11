@@ -156,6 +156,10 @@ Requests requiring `X-Review-Token`:
 
 ## AWS deployment
 
+For the existing CivicCanarySites, CivicCanaryFindings, CivicCanaryReviews tables and
+civic-canary bucket, follow [Existing AWS storage](EXISTING_AWS_STORAGE.md).
+That path needs no new tables or CDK deployment.
+
 The production design targets `us-east-1` and uses Bedrock, AgentCore Runtime and Browser, Lambda,
 API Gateway, DynamoDB, S3, Secrets Manager, Systems Manager Parameter Store, EventBridge Scheduler,
 CloudWatch, IAM, and AWS Budgets.

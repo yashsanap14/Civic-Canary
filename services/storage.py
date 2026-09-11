@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from threading import RLock
 from typing import Any
+from urllib.parse import quote
 
 import boto3
 from botocore.exceptions import ClientError
@@ -205,6 +206,29 @@ class InMemoryStore(Store):
 
 
 class AwsStore(Store):
+    target_key = "target_id"
+    finding_key = "finding_id"
+
+    def _target_item(self, target: PortalTarget) -> dict:
+        item = _dynamo_item(target)
+        item[self.target_key] = item.pop("target_id")
+        return item
+
+    def _finding_item(self, finding: Finding) -> dict:
+        item = _dynamo_item(finding)
+        item[self.finding_key] = item.pop("finding_id")
+        return item
+
+    def _target_model(self, item: dict) -> PortalTarget:
+        return PortalTarget.model_validate(
+            {**_from_dynamo(item), "target_id": item[self.target_key]}
+        )
+
+    def _finding_model(self, item: dict) -> Finding:
+        return Finding.model_validate(
+            {**_from_dynamo(item), "finding_id": item[self.finding_key]}
+        )
+
     def __init__(
         self,
         *,
@@ -222,8 +246,10 @@ class AwsStore(Store):
         self.bucket = evidence_bucket
 
     def get_target(self, target_id: str) -> PortalTarget | None:
-        item = self.targets.get_item(Key={"target_id": target_id}).get("Item")
-        return PortalTarget.model_validate(_from_dynamo(item)) if item else None
+        item = self.targets.get_item(
+            Key={self.target_key: target_id}, ConsistentRead=True
+        ).get("Item")
+        return self._target_model(item) if item else None
 
     @staticmethod
     def _scan_all(table) -> list[dict[str, Any]]:
@@ -239,12 +265,12 @@ class AwsStore(Store):
 
     def list_targets(self) -> list[PortalTarget]:
         return [
-            PortalTarget.model_validate(_from_dynamo(item))
+            self._target_model(item)
             for item in self._scan_all(self.targets)
         ]
 
     def put_target(self, target: PortalTarget) -> None:
-        self.targets.put_item(Item=_dynamo_item(target))
+        self.targets.put_item(Item=self._target_item(target))
 
     def get_baseline(self, target_id: str) -> PortalSnapshot | None:
         try:
@@ -299,12 +325,12 @@ class AwsStore(Store):
 
     def put_finding(self, finding: Finding) -> bool:
         if finding.status != "OPEN":
-            self.findings.put_item(Item=_dynamo_item(finding))
+            self.findings.put_item(Item=self._finding_item(finding))
             return True
         try:
             self.findings.put_item(
-                Item=_dynamo_item(finding),
-                ConditionExpression="attribute_not_exists(finding_id)",
+                Item=self._finding_item(finding),
+                ConditionExpression=f"attribute_not_exists({self.finding_key})",
             )
             return True
         except ClientError as exc:
@@ -313,8 +339,10 @@ class AwsStore(Store):
             raise
 
     def get_finding(self, finding_id: str) -> Finding | None:
-        item = self.findings.get_item(Key={"finding_id": finding_id}).get("Item")
-        return Finding.model_validate(_from_dynamo(item)) if item else None
+        item = self.findings.get_item(
+            Key={self.finding_key: finding_id}, ConsistentRead=True
+        ).get("Item")
+        return self._finding_model(item) if item else None
 
     def transition_finding(
         self,
@@ -323,7 +351,7 @@ class AwsStore(Store):
     ) -> bool:
         try:
             self.findings.put_item(
-                Item=_dynamo_item(finding),
+                Item=self._finding_item(finding),
                 ConditionExpression="#finding_status = :expected",
                 ExpressionAttributeNames={"#finding_status": "status"},
                 ExpressionAttributeValues={":expected": expected_status.value},
@@ -337,7 +365,7 @@ class AwsStore(Store):
     def list_findings(self) -> list[Finding]:
         return sorted(
             [
-                Finding.model_validate(_from_dynamo(item))
+                self._finding_model(item)
                 for item in self._scan_all(self.findings)
             ],
             key=lambda finding: finding.created_at,
@@ -365,3 +393,125 @@ class AwsStore(Store):
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=300,
         )
+
+
+class ExistingAwsStore(AwsStore):
+    """Existing Sites/Findings/Reviews tables; scan records live in S3.
+
+    Domain models stay snake_case. Only DynamoDB partition keys are translated.
+    Terminal review decisions and finding transitions commit atomically.
+    """
+
+    target_key = "siteId"
+    finding_key = "findingId"
+
+    def __init__(
+        self,
+        *,
+        sites_table: str = "CivicCanarySites",
+        findings_table: str = "CivicCanaryFindings",
+        reviews_table: str = "CivicCanaryReviews",
+        evidence_bucket: str = "civic-canary",
+        region: str = "us-east-1",
+    ) -> None:
+        dynamodb = boto3.resource("dynamodb", region_name=region)
+        self.targets = dynamodb.Table(sites_table)
+        self.findings = dynamodb.Table(findings_table)
+        self.reviews = dynamodb.Table(reviews_table)
+        # A separate low-level client avoids DynamoDB resource double serialization.
+        self.ddb = boto3.client("dynamodb", region_name=region)
+        self.s3 = boto3.client("s3", region_name=region)
+        self.bucket = evidence_bucket
+
+    @staticmethod
+    def _run_key(run_id: str) -> str:
+        return f"runs/{quote(run_id, safe='')}.json"
+
+    def put_run(self, run: Run) -> None:
+        self.s3.put_object(
+            Bucket=self.bucket, Key=self._run_key(run.run_id),
+            Body=run.model_dump_json().encode(), ContentType="application/json",
+        )
+
+    def create_run(self, run: Run) -> bool:
+        try:
+            self.s3.put_object(
+                Bucket=self.bucket, Key=self._run_key(run.run_id),
+                Body=run.model_dump_json().encode(), ContentType="application/json",
+                IfNoneMatch="*",
+            )
+            return True
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {"PreconditionFailed", "412"}:
+                return False
+            raise
+
+    def get_run(self, run_id: str) -> Run | None:
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=self._run_key(run_id))
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {"NoSuchKey", "404"}:
+                return None
+            raise
+        return Run.model_validate_json(response["Body"].read())
+
+    def list_runs(self) -> list[Run]:
+        runs = []
+        for page in self.s3.get_paginator("list_objects_v2").paginate(
+            Bucket=self.bucket, Prefix="runs/"
+        ):
+            for item in page.get("Contents", []):
+                if not item["Key"].endswith(".json"):
+                    continue
+                response = self.s3.get_object(Bucket=self.bucket, Key=item["Key"])
+                runs.append(Run.model_validate_json(response["Body"].read()))
+        return sorted(
+            runs, key=lambda run: run.started_at or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+
+    def transition_finding(self, finding: Finding, expected_status: FindingStatus) -> bool:
+        if finding.status not in {FindingStatus.APPROVED, FindingStatus.REJECTED}:
+            return super().transition_finding(finding, expected_status)
+        from boto3.dynamodb.types import TypeSerializer
+
+        serializer = TypeSerializer()
+
+        def serialize(item: dict) -> dict:
+            return {key: serializer.serialize(value) for key, value in item.items()}
+
+        review = _to_dynamo({
+            "reviewId": f"review-{finding.finding_id}",
+            "findingId": finding.finding_id,
+            "siteId": finding.target_id,
+            "runId": finding.run_id,
+            "action": "APPROVE" if finding.status == FindingStatus.APPROVED else "REJECT",
+            "note": finding.decision_note,
+            "decidedAt": finding.decided_at.isoformat() if finding.decided_at else None,
+            "approvedArtifactKey": finding.approved_artifact_key,
+        })
+        try:
+            self.ddb.transact_write_items(TransactItems=[
+                {"Put": {
+                    "TableName": self.findings.name,
+                    "Item": serialize(self._finding_item(finding)),
+                    "ConditionExpression": "#s = :expected",
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": {
+                        ":expected": serializer.serialize(expected_status.value)
+                    },
+                }},
+                {"Put": {
+                    "TableName": self.reviews.name,
+                    "Item": serialize(review),
+                    "ConditionExpression": "attribute_not_exists(reviewId)",
+                }},
+            ])
+            return True
+        except ClientError as exc:
+            reasons = exc.response.get("CancellationReasons", [])
+            if exc.response["Error"]["Code"] == "TransactionCanceledException" and any(
+                reason.get("Code") == "ConditionalCheckFailed" for reason in reasons
+            ):
+                return False
+            raise

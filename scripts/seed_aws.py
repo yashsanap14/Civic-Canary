@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import boto3
 
 from agent.civic_canary.models import PortalTarget
+from services.store_factory import default_store
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,7 +49,30 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stack", default="CivicCanaryMvp")
     parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--existing", action="store_true",
+                        help="Seed the configured existing tables and bucket without CDK")
     args = parser.parse_args()
+    if args.existing:
+        import os
+
+        os.environ["CIVIC_CANARY_MODE"] = "aws"
+        os.environ["AWS_STORAGE_LAYOUT"] = "existing"
+        os.environ["AWS_REGION"] = args.region
+        store = default_store()
+        target = PortalTarget()
+        if store.get_target(target.target_id) is not None:
+            raise SystemExit(
+                "Target already exists; refusing to overwrite its baseline/configuration."
+            )
+        # Store the playbook before making the new target visible.
+        store.s3.put_object(
+            Bucket=store.bucket, Key=target.playbook_key,
+            Body=(ROOT / "agent" / "fixtures" / "benefits-playbook.md").read_bytes(),
+            ContentType="text/markdown",
+        )
+        store.put_target(target)
+        print("Seeded existing storage with the synthetic V1 target and playbook.")
+        return
     seed(args.stack, args.region)
     print("Seeded the synthetic target and playbook. The first V1 scan establishes its baseline.")
 
