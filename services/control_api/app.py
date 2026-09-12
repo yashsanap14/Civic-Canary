@@ -27,6 +27,7 @@ from agent.civic_canary.models import (
     RunRequest,
     TriggerType,
 )
+from agent.civic_canary.scenarios import seed_targets
 from services.observability import log_event
 from services.runtime import ScanService
 from services.security import ReviewTokenVerifier
@@ -39,8 +40,10 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
     app.state.store = store or default_store()
     app.state.verifier = verifier or ReviewTokenVerifier()
     local_mode = os.getenv("CIVIC_CANARY_MODE", "local") != "aws"
-    if local_mode and not app.state.store.get_target("benefits-demo"):
-        app.state.store.put_target(PortalTarget())
+    if local_mode:
+        for target in seed_targets():
+            if not app.state.store.get_target(target.target_id):
+                app.state.store.put_target(target)
 
     origins = [
         origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
@@ -84,6 +87,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         target = PortalTarget(
             target_id=f"site-{uuid.uuid4().hex[:12]}",
             name=request.name,
+            kind="live",
             start_url=request.public_url,
             allowed_hosts=[host],
             journey_steps=[JourneyStep(path="/", label="Submitted page")],
@@ -92,6 +96,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             scan_frequency_minutes=request.scan_frequency_minutes,
             guidance_context=request.guidance_context,
             setup_status="PENDING",
+            change_summary="No scripted change—future scans compare against the captured live baseline.",
         )
         app.state.store.put_target(target)
         if local_mode:
@@ -294,7 +299,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                 "run": enqueue_scan(app.state.store, target, TriggerType.MANUAL, run_id),
                 "findings": [],
             }
-        if target.target_id != "benefits-demo" and target.setup_status != "ACTIVE":
+        if target.target_id != "benefits-demo" and target.kind != "demo" and target.setup_status != "ACTIVE":
             raise HTTPException(409, "Confirm monitoring sections before scanning")
         service = ScanService(app.state.store)
         if service.agentcore_arn():

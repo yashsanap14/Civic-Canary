@@ -228,11 +228,25 @@ class FixtureBrowserAdapter(BrowserAdapter):
     def __init__(self, fixture_root: Path) -> None:
         self.fixture_root = fixture_root.resolve()
 
+    def _version_root(self, target: PortalTarget) -> Path:
+        version = target.active_version
+        if version not in {"v1", "v2"}:
+            raise UnsafeTargetError("invalid fixture version")
+        namespace = (target.fixture_namespace or "").strip("/")
+        if namespace:
+            if not re.fullmatch(r"[a-z0-9-]+", namespace):
+                raise UnsafeTargetError("invalid fixture namespace")
+            version_root = (self.fixture_root / namespace / version).resolve()
+        else:
+            version_root = (self.fixture_root / version).resolve()
+        if self.fixture_root not in version_root.parents:
+            raise UnsafeTargetError("invalid fixture version")
+        return version_root
+
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target, allow_local=True)
-        version_root = (self.fixture_root / target.active_version).resolve()
-        if version_root.parent != self.fixture_root:
-            raise UnsafeTargetError("invalid fixture version")
+        version_root = self._version_root(target)
+        host = (target.allowed_hosts[0] if target.allowed_hosts else "benefits.demo.local").lower()
 
         def status_for(href: str) -> int:
             if not href or href.startswith(("#", "mailto:", "tel:")):
@@ -249,7 +263,7 @@ class FixtureBrowserAdapter(BrowserAdapter):
             if page_path.parent != version_root or not page_path.is_file():
                 raise FileNotFoundError(f"fixture page not found: {step.path}")
             html = page_path.read_text(encoding="utf-8")
-            url = f"https://benefits.demo.local/{step.path.lstrip('/')}"
+            url = f"https://{host}/{step.path.lstrip('/')}"
             pages.append(_page_from_html(html, url=url, link_status=status_for))
         return PortalSnapshot(
             target_id=target.target_id,

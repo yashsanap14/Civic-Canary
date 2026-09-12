@@ -89,8 +89,10 @@ class ScanService:
             else:
                 from agent.civic_canary.browser import HttpBrowserAdapter
 
-                live_site = target.target_id != "benefits-demo" and "{version}" not in (
-                    target.start_url or ""
+                live_site = target.kind == "live" or (
+                    target.target_id != "benefits-demo"
+                    and "{version}" not in (target.start_url or "")
+                    and not (target.start_url or "").startswith("fixture:")
                 )
                 browser = (
                     self.browser

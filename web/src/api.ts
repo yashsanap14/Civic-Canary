@@ -3,6 +3,9 @@ export type Target = {
   name: string
   active_version: 'v1' | 'v2'
   enabled: boolean
+  kind?: 'demo' | 'live'
+  fixture_namespace?: string
+  change_summary?: string
   start_url?: string
   description?: string
   monitoring_objective?: string

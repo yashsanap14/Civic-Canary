@@ -147,6 +147,14 @@ class PortalTarget(BaseModel):
 
     last_scan_at: datetime | None = None
 
+    kind: Literal["demo", "live"] = "demo"
+
+    fixture_namespace: str = ""
+
+    change_summary: str = (
+        "V2 adds a required award letter, breaks Spanish guidance, and removes a form label."
+    )
+
     target_id: str = "benefits-demo"
 
     name: str = "River County Benefits Portal"

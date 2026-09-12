@@ -28,16 +28,26 @@ function formatTime(value: string | null) {
 }
 
 function isDemoTarget(target: Target | null | undefined) {
-  return target?.target_id === 'benefits-demo'
+  if (!target) return false
+  return target.kind === 'demo' || target.target_id.endsWith('-demo') || target.target_id === 'benefits-demo'
 }
 
 function targetLabel(target: Target) {
-  return isDemoTarget(target) ? `${target.name} (Demo)` : `${target.name} (Live)`
+  return isDemoTarget(target) ? target.name : target.name
+}
+
+function demoPortalHref(target: Target | null) {
+  if (!target) return '/portal/v1/index.html'
+  const version = target.active_version ?? 'v1'
+  const namespace = target.fixture_namespace?.trim()
+  return namespace ? `/portal/${namespace}/${version}/index.html` : `/portal/${version}/index.html`
 }
 
 export default function App() {
   const [target, setTarget] = useState<Target | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
+  const [demoFocusId, setDemoFocusId] = useState('benefits-demo')
+  const [liveFocusId, setLiveFocusId] = useState('')
   const [showAdd, setShowAdd] = useState(false)
   const [sections, setSections] = useState('')
   const [runs, setRuns] = useState<Run[]>([])
@@ -58,6 +68,10 @@ export default function App() {
     ])
     setTargets(targetRows)
     setTarget((current) => targetRows.find((row) => row.target_id === current?.target_id) ?? targetRows[0] ?? null)
+    const demos = targetRows.filter((item) => isDemoTarget(item))
+    const lives = targetRows.filter((item) => !isDemoTarget(item))
+    setDemoFocusId((current) => demos.some((item) => item.target_id === current) ? current : demos[0]?.target_id ?? 'benefits-demo')
+    setLiveFocusId((current) => lives.some((item) => item.target_id === current) ? current : lives[0]?.target_id ?? '')
     const focusId = new URLSearchParams(window.location.search).get('finding')
     if (focusId && token) setSelectedFinding(await api.finding(focusId, token))
     setRuns(runRows)
@@ -98,8 +112,10 @@ export default function App() {
   }, [findingDialogId, runDialogId, showAdd])
 
   const visibleFindings = findings.filter((finding) => finding.target_id === target?.target_id)
+  const demoTargets = targets.filter((item) => isDemoTarget(item))
   const liveTargets = targets.filter((item) => !isDemoTarget(item))
-  const demoTarget = targets.find((item) => isDemoTarget(item)) ?? null
+  const selectedDemo = demoTargets.find((item) => item.target_id === demoFocusId) ?? demoTargets[0] ?? null
+  const selectedLive = liveTargets.find((item) => item.target_id === liveFocusId) ?? liveTargets[0] ?? null
   const openFindings = useMemo(
     () => findings.filter((finding) => finding.status === 'OPEN' && finding.target_id === target?.target_id),
     [findings, target?.target_id],
@@ -120,10 +136,12 @@ export default function App() {
     }
   }
 
-  const setVersion = (version: 'v1' | 'v2') =>
-    act(() => api.setVersion(version, token, 'benefits-demo'), `Demo portal switched to ${version.toUpperCase()}.`)
+  const setVersion = (version: 'v1' | 'v2') => {
+    if (!selectedDemo) return
+    void act(() => api.setVersion(version, token, selectedDemo.target_id), `Demo portal switched to ${version.toUpperCase()}.`)
+  }
 
-  const runScan = async (targetId = target?.target_id) => {
+  const runScan = async (targetId = selectedLive?.target_id) => {
     if (!targetId) return
     setBusy(true)
     setError('')
@@ -138,7 +156,7 @@ export default function App() {
       }
       await load()
       if (run.status === 'FAILED') throw new Error(run.summary || 'The scan failed.')
-      setMessage('Scan complete. Findings are ready for review.')
+      setMessage('Scan complete. Findings are ready for review when material changes were detected.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Something went wrong')
     } finally {
@@ -147,12 +165,13 @@ export default function App() {
   }
 
   const triggerDemoChange = async () => {
+    if (!selectedDemo) return
     setBusy(true)
     setError('')
     setMessage('')
     try {
-      await api.setVersion('v2', token, 'benefits-demo')
-      const started = await api.startRun(token, 'benefits-demo')
+      await api.setVersion('v2', token, selectedDemo.target_id)
+      const started = await api.startRun(token, selectedDemo.target_id)
       let run = started.run
       for (let attempt = 0; run.status === 'QUEUED' || run.status === 'RUNNING'; attempt += 1) {
         if (attempt >= 150) throw new Error('The demo scan is still running. Check Recent runs shortly.')
@@ -160,10 +179,10 @@ export default function App() {
         run = await api.run(run.run_id, token)
       }
       const rows = await load()
-      const demo = rows.find((item) => item.target_id === 'benefits-demo') ?? null
+      const demo = rows.find((item) => item.target_id === selectedDemo.target_id) ?? null
       if (demo) setTarget(demo)
       if (run.status === 'FAILED') throw new Error(run.summary || 'The demo scan failed.')
-      setMessage('Demo change triggered. V2 findings are ready for review.')
+      setMessage(`${selectedDemo.name}: V2 change triggered. Findings are ready for review.`)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The demo change could not be triggered')
     } finally {
@@ -206,6 +225,7 @@ export default function App() {
       setShowAdd(false)
       const rows = await load()
       setTarget(rows.find((row) => row.target_id === added.target_id) ?? added)
+      setLiveFocusId(added.target_id)
       const status = added.setup_status
       setMessage(
         status === 'AWAITING_CONFIRMATION'
@@ -221,6 +241,8 @@ export default function App() {
     const next = targets.find((item) => item.target_id === targetId) ?? null
     setTarget(next)
     setSections('')
+    if (next && isDemoTarget(next)) setDemoFocusId(next.target_id)
+    if (next && !isDemoTarget(next)) setLiveFocusId(next.target_id)
   }
 
   return (
@@ -242,23 +264,70 @@ export default function App() {
           </div>
           <div className="hero-status" aria-label="Current target status">
             <span className="pulse" aria-hidden="true" />
-            <div><small>Monitoring</small><strong>{target ? targetLabel(target) : 'Loading target…'}</strong></div>
+            <div><small>Monitoring</small><strong>{target ? `${targetLabel(target)} · ${isDemoTarget(target) ? 'Demo' : 'Live'}` : 'Loading target…'}</strong></div>
           </div>
         </section>
 
         <section className="feature-split" aria-label="Monitoring modes">
-          <article className="feature-panel live-panel">
-            <p className="kicker">Live website monitoring</p>
-            <h2>Watch a real public site</h2>
-            <p>Validate a public HTTPS URL, capture a baseline with AgentCore Browser and Strands analysis, then schedule quiet scans that only notify when human review is required.</p>
-            <label htmlFor="website-select">Monitored website</label>
+          <article className="feature-panel demo-scenario">
+            <p className="kicker">Demo scenarios</p>
+            <h2>Controlled V1 → V2 changes</h2>
+            <p>Pick a synthetic community portal. V1 is the trusted baseline; Trigger Demo Change flips to V2 and runs the same scan → finding → approve/reject workflow.</p>
+            <label htmlFor="demo-select">Demo scenario</label>
             <select
-              id="website-select"
-              value={target?.target_id ?? ''}
+              id="demo-select"
+              value={selectedDemo?.target_id ?? ''}
               onChange={(event) => selectTarget(event.target.value)}
             >
-              {targets.map((item) => (
-                <option key={item.target_id} value={item.target_id}>{targetLabel(item)}</option>
+              {demoTargets.map((item) => (
+                <option key={item.target_id} value={item.target_id}>{item.name}</option>
+              ))}
+            </select>
+            <p className="feature-hint">{selectedDemo?.change_summary ?? 'Select a demo scenario to see its controlled change.'}</p>
+            <div className="version-switch" aria-label="Demo portal version">
+              {(['v1', 'v2'] as const).map((version) => (
+                <button
+                  key={version}
+                  className={selectedDemo?.active_version === version ? 'active' : ''}
+                  disabled={!token || busy || !selectedDemo}
+                  onClick={() => setVersion(version)}
+                >
+                  {version.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <div className="feature-actions">
+              <button
+                className="secondary-button"
+                disabled={!token || busy || !selectedDemo}
+                onClick={() => void act(() => api.setVersion('v1', token, selectedDemo?.target_id), 'Demo reset to V1. Run Trigger Demo Change after reviewing the baseline.')}
+              >
+                Reset to V1
+              </button>
+              <button className="primary-button" disabled={!token || busy || !selectedDemo} onClick={() => void triggerDemoChange()}>
+                {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
+                {busy ? 'Working…' : 'Trigger Demo Change'}
+              </button>
+            </div>
+            <a className="portal-link" href={demoPortalHref(selectedDemo)} target="_blank" rel="noreferrer">
+              Open demo portal <ArrowRight aria-hidden="true" />
+            </a>
+          </article>
+
+          <article className="feature-panel live-panel">
+            <p className="kicker">Live websites</p>
+            <h2>Watch real public pages</h2>
+            <p>Fairfax examples and any site you add use the live page as baseline—no scripted V2. Future scans detect real changes and notify only when review is needed.</p>
+            <label htmlFor="website-select">Live website</label>
+            <select
+              id="website-select"
+              value={selectedLive?.target_id ?? ''}
+              onChange={(event) => selectTarget(event.target.value)}
+            >
+              {liveTargets.length === 0 ? (
+                <option value="">No live websites yet</option>
+              ) : liveTargets.map((item) => (
+                <option key={item.target_id} value={item.target_id}>{item.name}</option>
               ))}
             </select>
             <div className="feature-actions">
@@ -279,94 +348,50 @@ export default function App() {
               >
                 <Globe2 aria-hidden="true" /> + Add Live Website
               </button>
-              {!isDemoTarget(target) && (
-                <button
-                  className="secondary-button"
-                  disabled={!token || busy || target?.setup_status !== 'ACTIVE'}
-                  onClick={() => void runScan()}
-                >
-                  {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
-                  {busy ? 'Working…' : 'Scan Live Website Now'}
-                </button>
-              )}
+              <button
+                className="secondary-button"
+                disabled={!token || busy || !selectedLive || selectedLive.setup_status !== 'ACTIVE'}
+                onClick={() => void runScan(selectedLive?.target_id)}
+              >
+                {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
+                {busy ? 'Working…' : 'Scan Live Website Now'}
+              </button>
             </div>
             {!token && (
-              <p className="feature-hint">Review token required before adding a live website—use the Reviewer Access panel.</p>
+              <p className="feature-hint">Review token required before adding or scanning a live website.</p>
             )}
-            {liveTargets.length === 0 && (
-              <p className="feature-hint">No live websites yet. Add one to start real monitoring alongside the demo scenario.</p>
-            )}
-            {!isDemoTarget(target) && target && target.setup_status && target.setup_status !== 'ACTIVE' && (
+            {selectedLive && selectedLive.setup_status && selectedLive.setup_status !== 'ACTIVE' && (
               <div className="setup-status">
-                <strong>Setup: {target.setup_status.replaceAll('_', ' ')}</strong>
-                <p>Run: {target.setup_run_id}</p>
-                {target.setup_status === 'AWAITING_CONFIRMATION' && <>
+                <strong>Setup: {selectedLive.setup_status.replaceAll('_', ' ')}</strong>
+                <p>Run: {selectedLive.setup_run_id}</p>
+                {selectedLive.setup_status === 'AWAITING_CONFIRMATION' && <>
                   <p>The agent found these relevant headings. Accept them or edit one section per line.</p>
                   <textarea
                     aria-label="Sections to monitor"
-                    value={sections || (target.recommended_sections ?? []).join('\n')}
+                    value={sections || (selectedLive.recommended_sections ?? []).join('\n')}
                     onChange={(event) => setSections(event.target.value)}
                   />
                   <button
                     className="primary-button"
                     disabled={!token || busy}
                     onClick={() => void act(
-                      () => api.confirm(target.target_id, (sections || (target.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean), token),
+                      () => api.confirm(selectedLive.target_id, (sections || (selectedLive.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean), token),
                       'Monitoring confirmed. The background worker will scan on schedule.',
                     )}
                   >
                     Confirm monitoring
                   </button>
                 </>}
-                {target.setup_status === 'FAILED' && (
-                  <button disabled={busy} onClick={() => void act(() => api.inspect(target.target_id, token), 'Inspection queued again.')}>
+                {selectedLive.setup_status === 'FAILED' && (
+                  <button disabled={busy} onClick={() => void act(() => api.inspect(selectedLive.target_id, token), 'Inspection queued again.')}>
                     Retry inspection
                   </button>
                 )}
               </div>
             )}
-            {!isDemoTarget(target) && target?.setup_status === 'ACTIVE' && (
-              <p className="feature-hint">Next scan: {formatTime(target.next_scan_at ?? null)}. Cosmetic/CSS-only changes stay quiet.</p>
+            {selectedLive?.setup_status === 'ACTIVE' && (
+              <p className="feature-hint">Next scan: {formatTime(selectedLive.next_scan_at ?? null)}. First scan captures the real live baseline; later scans look for meaningful drift.</p>
             )}
-          </article>
-
-          <article className="feature-panel demo-scenario">
-            <p className="kicker">Demo scenario</p>
-            <h2>V1 → V2 controlled change</h2>
-            <p>Hackathon fixture portal. V1 is the trusted baseline. V2 adds one document requirement, breaks Spanish guidance, and removes a form label.</p>
-            <div className="version-switch" aria-label="Demo portal version">
-              {(['v1', 'v2'] as const).map((version) => (
-                <button
-                  key={version}
-                  className={demoTarget?.active_version === version ? 'active' : ''}
-                  disabled={!token || busy}
-                  onClick={() => void setVersion(version)}
-                >
-                  {version.toUpperCase()}
-                </button>
-              ))}
-            </div>
-            <div className="feature-actions">
-              <button
-                className="secondary-button"
-                disabled={!token || busy}
-                onClick={() => void act(() => api.setVersion('v1', token, 'benefits-demo'), 'Demo reset to V1. Run a scan to establish the baseline.')}
-              >
-                Reset to V1
-              </button>
-              <button className="primary-button" disabled={!token || busy || !demoTarget} onClick={() => void triggerDemoChange()}>
-                {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
-                {busy ? 'Working…' : 'Trigger Demo Change'}
-              </button>
-            </div>
-            <a
-              className="portal-link"
-              href={`/portal/${demoTarget?.active_version ?? 'v1'}/index.html`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open demo portal <ArrowRight aria-hidden="true" />
-            </a>
           </article>
         </section>
 
@@ -472,21 +497,25 @@ export default function App() {
             <button className="close-button" onClick={() => setSelectedFinding(null)} aria-label="Close finding"><X aria-hidden="true" /></button>
             <span className={`severity severity-${selectedFinding.severity.toLowerCase()}`}>{selectedFinding.severity}</span>
             <h2 id="finding-title">{selectedFinding.title}</h2>
-            <p className="drawer-meta">{selectedFinding.category.replace('_', ' ')} · {selectedFinding.status}</p>
+            <p className="drawer-meta">{selectedFinding.category.replace('_', ' ')} · Severity {selectedFinding.severity} · {selectedFinding.status}</p>
+            <h3>Previous state</h3>
+            <p>{selectedFinding.before || 'Not stated on the previous page.'}</p>
+            <h3>Current state</h3>
+            <p>{selectedFinding.after || selectedFinding.title}</p>
             <h3>What changed</h3>
             <div className="before-after"><div><h4>Before</h4><p>{selectedFinding.before || 'See source evidence below.'}</p></div><div><h4>After</h4><p>{selectedFinding.after || selectedFinding.title}</p></div></div>
             <h3>Why it matters</h3><p>{selectedFinding.why_it_matters || 'Review the source evidence before changing guidance.'}</p>
             <h3>Who may be affected</h3><p>{selectedFinding.affected_people || 'People using this public service.'}</p>
             <p>Agent confidence: {selectedFinding.agent_confidence == null ? 'Not model-scored' : `${Math.round(selectedFinding.agent_confidence * 100)}% (self-assessed)`}</p>
             <p>Reasoning: {selectedFinding.reasoning_source ?? 'Fixture'} · Run: {selectedFinding.run_id}</p>
-            <h3>Source evidence</h3>
+            <h3>Evidence</h3>
             {selectedFinding.evidence_urls?.map((url, index) => <p key={url}><a href={url} target="_blank" rel="noreferrer">Open evidence {index + 1}</a></p>)}
             <ul>{selectedFinding.evidence.map((item) => <li key={item}>{item}</li>)}</ul>
             {selectedFinding.screenshot_urls.map((url) => (
               <img className="evidence-image" key={url} src={url} alt="Portal captured during this finding's scan" />
             ))}
-            <h3>Affected guidance</h3>
-            <p>{selectedFinding.affected_playbook_sections.join(', ')}</p>
+            <h3>Affected community guidance</h3>
+            <p>{selectedFinding.affected_playbook_sections.join(', ') || 'Needs playbook owner review'}</p>
             <h3>Current guidance</h3><p>{selectedFinding.current_guidance || 'No matching guidance supplied; proposed wording is a new draft.'}</p>
             <h3>Proposed guidance</h3>
             <pre>{selectedFinding.proposed_patch}</pre>
@@ -500,7 +529,7 @@ export default function App() {
                 <textarea id="decision-note" value={note} onChange={(event) => setNote(event.target.value)} placeholder="Optional evidence or reason" />
                 <div className="decision-actions">
                   <button className="secondary-button" disabled={!token || busy} onClick={() => decide('REJECT')}><X aria-hidden="true" /> Reject</button>
-                  <button className="primary-button" disabled={!token || busy} onClick={() => decide('APPROVE')}><Check aria-hidden="true" /> Approve draft</button>
+                  <button className="primary-button" disabled={!token || busy} onClick={() => decide('APPROVE')}><Check aria-hidden="true" /> Approve</button>
                 </div>
               </>
             )}
