@@ -459,7 +459,7 @@ def test_real_strands_graph_executes_collection_and_structured_nodes(monkeypatch
                 (spec["name"] for spec in (tool_specs or []) if spec["name"] in outputs), None
             )
             selected_tool = "collect_evidence" if not called else structured
-            payload = {} if not called else outputs.get(structured, {})
+            payload = {"purpose": "full_page"} if not called else outputs.get(structured, {})
             yield {"messageStart": {"role": "assistant"}}
             if selected_tool:
                 yield {
@@ -513,3 +513,179 @@ def test_real_strands_graph_executes_collection_and_structured_nodes(monkeypatch
         "strands-draft",
         "strands-verify",
     ]
+
+
+def test_collect_evidence_tool_schema_includes_purpose():
+    from strands import tool
+
+    @tool
+    def collect_evidence(purpose: str = "full_page") -> dict:
+        """Return evidence.
+
+        Args:
+            purpose: Short label for the request.
+        """
+        return {"purpose": purpose}
+
+    schema = collect_evidence.tool_spec["inputSchema"]["json"]
+    assert schema["type"] == "object"
+    assert "purpose" in schema["properties"]
+
+
+def test_resolve_setup_sections_keeps_observed_and_falls_back():
+    from agent.civic_canary.reasoning import DecisionPacket, resolve_setup_sections
+
+    page = snapshot(CASES[0]["before"]).pages[0]
+    current = snapshot(CASES[0]["before"])
+    packet = DecisionPacket(
+        summary="Setup",
+        recommendations=[],
+        recommended_sections=["Invented Section", page.headings[0]],
+    )
+    assert resolve_setup_sections(packet, current) == [page.headings[0]]
+    empty = DecisionPacket(summary="Setup", recommendations=[], recommended_sections=[])
+    assert resolve_setup_sections(empty, current) == list(
+        dict.fromkeys(heading for page in current.pages for heading in page.headings)
+    )[:20]
+
+
+def test_strands_setup_survives_empty_tool_input_json(monkeypatch):
+    """Bedrock often streams blank tool input for tools; capture must still succeed."""
+    from strands.models.model import Model
+
+    from agent.civic_canary.reasoning import (
+        Classification,
+        DecisionPacket,
+        GroundingVerdict,
+        StrandsReasoner,
+    )
+
+    class EmptyInputModel(Model):
+        def update_config(self, **kwargs):
+            pass
+
+        def get_config(self):
+            return {"model_id": "offline-test-model"}
+
+        async def structured_output(self, output_model, prompt, **kwargs):
+            values = {
+                Classification: {"summary": "Initial capture"},
+                DecisionPacket: {
+                    "summary": "Baseline ready",
+                    "recommendations": [],
+                    "recommended_sections": ["Invented"],
+                },
+                GroundingVerdict: {"supported": True},
+            }
+            yield {"output": output_model.model_validate(values[output_model])}
+
+        async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+            called = any(
+                "toolResult" in item for message in messages for item in message.get("content", [])
+            )
+            outputs = {
+                "Classification": {"summary": "Initial capture"},
+                "DecisionPacket": {
+                    "summary": "Baseline ready",
+                    "recommendations": [],
+                    "recommended_sections": ["Invented"],
+                },
+                "GroundingVerdict": {"supported": True},
+            }
+            structured = next(
+                (spec["name"] for spec in (tool_specs or []) if spec["name"] in outputs), None
+            )
+            selected_tool = "collect_evidence" if not called else structured
+            # Empty string reproduces the production warning path in Strands streaming.
+            payload = "" if not called else json.dumps(outputs.get(structured, {}))
+            yield {"messageStart": {"role": "assistant"}}
+            if selected_tool:
+                yield {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 0,
+                        "start": {"toolUse": {"toolUseId": "tool-call", "name": selected_tool}},
+                    }
+                }
+                yield {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"toolUse": {"input": payload}},
+                    }
+                }
+            yield {"contentBlockStop": {"contentBlockIndex": 0}}
+            yield {"messageStop": {"stopReason": "tool_use" if selected_tool else "end_turn"}}
+            yield {
+                "metadata": {
+                    "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                    "metrics": {"latencyMs": 1},
+                }
+            }
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "offline-test-model")
+    monkeypatch.setattr(
+        "agent.civic_canary.reasoning.BedrockModel", lambda **kwargs: EmptyInputModel()
+    )
+    captures = []
+
+    def capture():
+        captures.append("called")
+        return snapshot(CASES[0]["before"])
+
+    current, rows, trace, _timings = StrandsReasoner().execute(
+        target().model_copy(update={"setup_status": "PENDING"}),
+        None,
+        "setup-empty-input",
+        "",
+        capture,
+    )
+    assert captures == ["called"]
+    assert rows == []
+    assert current.pages
+    assert trace["packet"]["recommended_sections"]
+    assert "Invented" not in trace["packet"]["recommended_sections"]
+    assert all(
+        section in {heading for page in current.pages for heading in page.headings}
+        or section == "Main content"
+        for section in trace["packet"]["recommended_sections"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_setup_run_reaches_awaiting_confirmation(monkeypatch):
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "aws")
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "offline-test-model")
+    store = InMemoryStore()
+    configured = target().model_copy(update={"setup_status": "PENDING", "kind": "live"})
+    store.put_target(configured)
+    captured = snapshot(CASES[0]["before"], site=configured.target_id)
+
+    def execute(self, configured_target, baseline, run_id, guidance, capture):
+        assert baseline is None
+        snap = capture()
+        packet = {
+            "summary": "Baseline ready",
+            "recommendations": [],
+            "recommended_sections": snap.pages[0].headings[:1],
+        }
+        return (
+            snap,
+            [],
+            {
+                "run_id": run_id,
+                "engine": "strands-bedrock",
+                "model_id": "offline-test-model",
+                "packet": packet,
+            },
+            [],
+        )
+
+    monkeypatch.setattr(StrandsReasoner, "execute", execute)
+    run, findings = await ScanService(store, FakeBrowser(captured)).run_local(
+        configured, "MANUAL", "setup-confirm"
+    )
+    assert run.status == "SUCCEEDED"
+    assert findings == []
+    refreshed = store.get_target(configured.target_id)
+    assert refreshed.setup_status == "AWAITING_CONFIRMATION"
+    assert refreshed.recommended_sections
+    assert store.get_baseline(configured.target_id) is not None
