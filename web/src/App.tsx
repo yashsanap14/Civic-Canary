@@ -206,7 +206,12 @@ export default function App() {
       setShowAdd(false)
       const rows = await load()
       setTarget(rows.find((row) => row.target_id === added.target_id) ?? added)
-      setMessage('Live website added. Inspection is queued—AgentCore will capture the baseline, then you confirm what to monitor.')
+      const status = added.setup_status
+      setMessage(
+        status === 'AWAITING_CONFIRMATION'
+          ? 'Live website added and baseline captured. Confirm the sections to monitor.'
+          : 'Live website added. Inspection is queued—refresh to check progress, then confirm what to monitor.',
+      )
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Website could not be added')
     } finally { setBusy(false) }
@@ -257,7 +262,21 @@ export default function App() {
               ))}
             </select>
             <div className="feature-actions">
-              <button className="primary-button" disabled={!token || busy} onClick={() => setShowAdd(true)}>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (!token) {
+                    setError('Enter your review token under Reviewer Access, then click + Add Live Website.')
+                    setMessage('')
+                    document.getElementById('review-token')?.focus()
+                    return
+                  }
+                  setError('')
+                  setShowAdd(true)
+                }}
+              >
                 <Globe2 aria-hidden="true" /> + Add Live Website
               </button>
               {!isDemoTarget(target) && (
@@ -271,6 +290,9 @@ export default function App() {
                 </button>
               )}
             </div>
+            {!token && (
+              <p className="feature-hint">Review token required before adding a live website—use the Reviewer Access panel.</p>
+            )}
             {liveTargets.length === 0 && (
               <p className="feature-hint">No live websites yet. Add one to start real monitoring alongside the demo scenario.</p>
             )}

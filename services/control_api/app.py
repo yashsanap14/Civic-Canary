@@ -70,19 +70,22 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             require_token(x_review_token)
 
     @app.post("/api/targets", dependencies=[Depends(require_token)])
-    def add_website(request: AddWebsiteRequest):
-        from agent.civic_canary.browser import validate_public_url
+    async def add_website(request: AddWebsiteRequest):
+        from agent.civic_canary.browser import HttpBrowserAdapter, validate_public_url
         from services.monitoring import enqueue_scan
 
         try:
             validate_public_url(request.public_url)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        host = urlparse(request.public_url).hostname
+        if not host:
+            raise HTTPException(422, "Public URL must include a hostname")
         target = PortalTarget(
             target_id=f"site-{uuid.uuid4().hex[:12]}",
             name=request.name,
             start_url=request.public_url,
-            allowed_hosts=[urlparse(request.public_url).hostname],
+            allowed_hosts=[host],
             journey_steps=[JourneyStep(path="/", label="Submitted page")],
             description=request.description,
             monitoring_objective=request.monitoring_objective,
@@ -90,9 +93,26 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             guidance_context=request.guidance_context,
             setup_status="PENDING",
         )
-        if local_mode:
-            raise HTTPException(409, "Adding live websites requires AWS mode and AgentCore Browser")
         app.state.store.put_target(target)
+        if local_mode:
+            # Local/hackathon path: inspect immediately over HTTPS (no AgentCore worker).
+            service = ScanService(app.state.store, HttpBrowserAdapter())
+            try:
+                run, _ = await service.run_local(target, TriggerType.MANUAL)
+            except RunExecutionError as exc:
+                failed = app.state.store.get_target(target.target_id) or target
+                failed.setup_status = "FAILED"
+                failed.setup_run_id = exc.run.run_id
+                app.state.store.put_target(failed)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "run_id": exc.run.run_id,
+                        "error_category": exc.run.error_category,
+                        "message": exc.run.summary or "Live website inspection failed",
+                    },
+                ) from exc
+            return app.state.store.get_target(target.target_id) or target
         run = enqueue_scan(app.state.store, target)
         target.setup_run_id = run.run_id
         app.state.store.put_target(target)
@@ -106,7 +126,8 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         return target
 
     @app.post("/api/targets/{target_id}/inspect", dependencies=[Depends(require_token)])
-    def inspect_website(target_id: str):
+    async def inspect_website(target_id: str):
+        from agent.civic_canary.browser import HttpBrowserAdapter
         from services.monitoring import enqueue_scan
 
         target = get_target(target_id)
@@ -116,8 +137,27 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             existing = app.state.store.get_run(target.setup_run_id)
             if existing and existing.status in {"QUEUED", "RUNNING"}:
                 return {"run": existing}
-        run = enqueue_scan(app.state.store, target)
         target.setup_status = "PENDING"
+        app.state.store.put_target(target)
+        if local_mode:
+            service = ScanService(app.state.store, HttpBrowserAdapter())
+            try:
+                run, _ = await service.run_local(target, TriggerType.MANUAL)
+            except RunExecutionError as exc:
+                failed = app.state.store.get_target(target_id) or target
+                failed.setup_status = "FAILED"
+                failed.setup_run_id = exc.run.run_id
+                app.state.store.put_target(failed)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "run_id": exc.run.run_id,
+                        "error_category": exc.run.error_category,
+                        "message": exc.run.summary or "Live website inspection failed",
+                    },
+                ) from exc
+            return {"run": run}
+        run = enqueue_scan(app.state.store, target)
         target.setup_run_id = run.run_id
         app.state.store.put_target(target)
         return {"run": run}
@@ -254,6 +294,8 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                 "run": enqueue_scan(app.state.store, target, TriggerType.MANUAL, run_id),
                 "findings": [],
             }
+        if target.target_id != "benefits-demo" and target.setup_status != "ACTIVE":
+            raise HTTPException(409, "Confirm monitoring sections before scanning")
         service = ScanService(app.state.store)
         if service.agentcore_arn():
             try:

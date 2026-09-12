@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from agent.civic_canary.browser import (
     AgentCoreBrowserAdapter,
+    HttpBrowserAdapter,
     UnsafeTargetError,
     _page_from_html,
     _snapshot_hash,
@@ -331,16 +332,21 @@ def test_protected_add_confirm_and_artifact_audit(monkeypatch):
     assert model.proposed_patch in artifact.text
 
 
-def test_local_mode_keeps_demo_and_blocks_live_add(monkeypatch):
+def test_local_mode_keeps_demo_and_allows_live_add(monkeypatch):
     monkeypatch.setenv("CIVIC_CANARY_MODE", "local")
     monkeypatch.setenv("REVIEW_TOKEN", "test-review-token")
     monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("8.8.8.8", 443))])
+
+    async def fake_capture(self, configured, run_id):
+        return snapshot("<article><h2>Home delivery</h2><p>Call 555-0101.</p></article>", site=configured.target_id, run_id=run_id)
+
+    monkeypatch.setattr(HttpBrowserAdapter, "capture", fake_capture)
     store = InMemoryStore()
     api = TestClient(create_app(store))
     headers = {"X-Review-Token": "test-review-token"}
     targets = api.get("/api/targets").json()
     assert any(row["target_id"] == "benefits-demo" for row in targets)
-    blocked = api.post(
+    added = api.post(
         "/api/targets",
         headers=headers,
         json={
@@ -349,8 +355,11 @@ def test_local_mode_keeps_demo_and_blocks_live_add(monkeypatch):
             "monitoring_objective": "Delivery contact information",
         },
     )
-    assert blocked.status_code == 409
-    assert "AgentCore" in blocked.json()["detail"]
+    assert added.status_code == 200
+    body = added.json()
+    assert body["setup_status"] == "AWAITING_CONFIRMATION"
+    assert "Home delivery" in body["recommended_sections"]
+    assert any(row["target_id"] == body["target_id"] for row in api.get("/api/targets").json())
     switched = api.post(
         "/api/demo/version",
         headers=headers,

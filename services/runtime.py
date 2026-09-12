@@ -87,15 +87,44 @@ class ScanService:
                     target.setup_run_id = resolved_run_id
                     self.store.put_target(target)
             else:
+                from agent.civic_canary.browser import HttpBrowserAdapter
+
+                live_site = target.target_id != "benefits-demo" and "{version}" not in (
+                    target.start_url or ""
+                )
+                browser = (
+                    self.browser
+                    if isinstance(self.browser, HttpBrowserAdapter) or not live_site
+                    else HttpBrowserAdapter()
+                )
+                if live_site and target.setup_status in {"PENDING", "FAILED"}:
+                    snapshot = await browser.capture(target, resolved_run_id)
+                    self.store.put_baseline(snapshot)
+                    self.store.put_snapshot(snapshot)
+                    headings = list(
+                        dict.fromkeys(
+                            heading for page in snapshot.pages for heading in page.headings
+                        )
+                    )[:20]
+                    target.recommended_sections = headings or ["Main content"]
+                    target.setup_status = "AWAITING_CONFIRMATION"
+                    target.setup_run_id = resolved_run_id
+                    self.store.put_target(target)
+                    run.status = RunStatus.SUCCEEDED
+                    run.summary = "Baseline captured. Confirm the sections to monitor."
+                    run.finished_at = datetime.now(UTC)
+                    run.reasoning_source = "http-baseline"
+                    self.store.put_run(run)
+                    return run, []
                 if baseline is None:
                     baseline_target = target.model_copy(
                         update={"active_version": target.baseline_version}
                     )
-                    baseline = await self.browser.capture(
+                    baseline = await browser.capture(
                         baseline_target, f"baseline-{resolved_run_id}"
                     )
                     self.store.put_baseline(baseline)
-                engine = CivicCanaryEngine(self.browser)
+                engine = CivicCanaryEngine(browser)
                 run, snapshot, findings = await engine.execute(
                     target=target,
                     baseline=baseline,
