@@ -17,6 +17,30 @@ import {
 import { api, type Finding, type Run, type Target } from './api'
 import './styles.css'
 
+const SESSION_KEYS = {
+  token: 'civic-canary.review-token',
+  targetId: 'civic-canary.target-id',
+  demoFocusId: 'civic-canary.demo-focus-id',
+  liveFocusId: 'civic-canary.live-focus-id',
+} as const
+
+function readSession(key: string) {
+  try {
+    return window.sessionStorage.getItem(key) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function writeSession(key: string, value: string) {
+  try {
+    if (value) window.sessionStorage.setItem(key, value)
+    else window.sessionStorage.removeItem(key)
+  } catch {
+    // Private mode or blocked storage should not break the dashboard.
+  }
+}
+
 function formatTime(value: string | null) {
   if (!value) return 'Not completed'
   return new Intl.DateTimeFormat(undefined, {
@@ -46,34 +70,55 @@ function demoPortalHref(target: Target | null) {
 export default function App() {
   const [target, setTarget] = useState<Target | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
-  const [demoFocusId, setDemoFocusId] = useState('benefits-demo')
-  const [liveFocusId, setLiveFocusId] = useState('')
+  const [demoFocusId, setDemoFocusId] = useState(() => readSession(SESSION_KEYS.demoFocusId) || 'benefits-demo')
+  const [liveFocusId, setLiveFocusId] = useState(() => readSession(SESSION_KEYS.liveFocusId))
   const [showAdd, setShowAdd] = useState(false)
   const [sections, setSections] = useState('')
   const [runs, setRuns] = useState<Run[]>([])
   const [findings, setFindings] = useState<Finding[]>([])
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null)
   const [selectedRun, setSelectedRun] = useState<Run | null>(null)
-  const [token, setToken] = useState('')
+  const [token, setToken] = useState(() => readSession(SESSION_KEYS.token))
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
 
-  const load = async () => {
+  const load = async (authToken = token) => {
     const [targetRows, runRows, findingRows] = await Promise.all([
-      api.targets(token),
-      api.runs(token),
-      api.findings(token),
+      api.targets(authToken),
+      api.runs(authToken),
+      api.findings(authToken),
     ])
     setTargets(targetRows)
-    setTarget((current) => targetRows.find((row) => row.target_id === current?.target_id) ?? targetRows[0] ?? null)
+    const preferredId = readSession(SESSION_KEYS.targetId)
+    setTarget((current) => {
+      const preferred = preferredId
+        ? targetRows.find((row) => row.target_id === preferredId)
+        : undefined
+      return preferred
+        ?? targetRows.find((row) => row.target_id === current?.target_id)
+        ?? targetRows[0]
+        ?? null
+    })
     const demos = targetRows.filter((item) => isDemoTarget(item))
     const lives = targetRows.filter((item) => !isDemoTarget(item))
-    setDemoFocusId((current) => demos.some((item) => item.target_id === current) ? current : demos[0]?.target_id ?? 'benefits-demo')
-    setLiveFocusId((current) => lives.some((item) => item.target_id === current) ? current : lives[0]?.target_id ?? '')
+    setDemoFocusId((current) => {
+      const next = demos.some((item) => item.target_id === current)
+        ? current
+        : demos[0]?.target_id ?? 'benefits-demo'
+      writeSession(SESSION_KEYS.demoFocusId, next)
+      return next
+    })
+    setLiveFocusId((current) => {
+      const next = lives.some((item) => item.target_id === current)
+        ? current
+        : lives[0]?.target_id ?? ''
+      writeSession(SESSION_KEYS.liveFocusId, next)
+      return next
+    })
     const focusId = new URLSearchParams(window.location.search).get('finding')
-    if (focusId && token) setSelectedFinding(await api.finding(focusId, token))
+    if (focusId && authToken) setSelectedFinding(await api.finding(focusId, authToken))
     setRuns(runRows)
     setFindings(findingRows)
     setSelectedFinding((current) =>
@@ -83,10 +128,26 @@ export default function App() {
   }
 
   useEffect(() => {
-    // The asynchronous load synchronizes the dashboard with the external API.
+    writeSession(SESSION_KEYS.token, token)
+  }, [token])
+
+  useEffect(() => {
+    if (target?.target_id) writeSession(SESSION_KEYS.targetId, target.target_id)
+  }, [target?.target_id])
+
+  useEffect(() => {
+    writeSession(SESSION_KEYS.demoFocusId, demoFocusId)
+  }, [demoFocusId])
+
+  useEffect(() => {
+    writeSession(SESSION_KEYS.liveFocusId, liveFocusId)
+  }, [liveFocusId])
+
+  useEffect(() => {
+    // Restore dashboard data after refresh, including a saved review token.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    load().catch((reason: Error) => setError(reason.message))
-  // Initial public/local load only. Protected reload is explicit after entering a token.
+    load(token).catch((reason: Error) => setError(reason.message))
+  // Initial load only; later reloads are explicit after actions.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -451,9 +512,29 @@ export default function App() {
             <p className="kicker">Reviewer access</p>
             <h2>Connect securely</h2>
             <label htmlFor="review-token"><KeyRound aria-hidden="true" /> Review token</label>
-            <input id="review-token" type="password" value={token} onChange={(event) => setToken(event.target.value)} autoComplete="off" placeholder="Required for actions" />
-            <button className="secondary-button" disabled={!token || busy} onClick={() => void act(load, 'Connected to reviewer dashboard.')}>Connect / refresh</button>
-            <p className="privacy-note">Held in memory only—never saved in this browser.</p>
+            <input
+              id="review-token"
+              type="password"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              autoComplete="off"
+              placeholder="Required for actions"
+            />
+            <button className="secondary-button" disabled={!token || busy} onClick={() => void act(() => load(token), 'Connected to reviewer dashboard.')}>Connect / refresh</button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={!token || busy}
+              onClick={() => {
+                setToken('')
+                writeSession(SESSION_KEYS.token, '')
+                setMessage('Review token cleared for this browser tab.')
+                setError('')
+              }}
+            >
+              Clear token
+            </button>
+            <p className="privacy-note">Saved for this browser tab only (survives refresh). Cleared when the tab closes, or use Clear token.</p>
             {target && !isDemoTarget(target) && (
               <a className="portal-link" href={target.start_url} target="_blank" rel="noreferrer">
                 Open live website <ArrowRight aria-hidden="true" />

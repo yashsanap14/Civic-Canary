@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from agent.civic_canary.engine import RunExecutionError
 from agent.civic_canary.models import Run, RunStatus, TriggerType
+from services.observability import log_event
 from services.runtime import ScanService
 
 
@@ -31,9 +34,111 @@ def enqueue_scan(store, target, trigger=TriggerType.MANUAL, run_id=None):
             store.put_json(
                 f"jobs/{run.run_id}.json", {"run_id": run.run_id, "target_id": target.target_id}
             )
+            log_event(
+                "scan_job_requeued",
+                run_id=run.run_id,
+                target_id=target.target_id,
+                trigger_type=trigger.value,
+            )
         return existing
     store.put_json(f"jobs/{run.run_id}.json", {"run_id": run.run_id, "target_id": target.target_id})
     index_run(store, run)
+    log_event(
+        "scan_job_enqueued",
+        run_id=run.run_id,
+        target_id=target.target_id,
+        trigger_type=trigger.value,
+        setup_status=target.setup_status,
+    )
+    return run
+
+
+def _scan_service(store):
+    """Use AgentCore Browser in AWS mode; otherwise the default adapter."""
+    if os.getenv("CIVIC_CANARY_MODE", "local") == "aws":
+        from agent.civic_canary.browser import AgentCoreBrowserAdapter
+
+        return ScanService(store, AgentCoreBrowserAdapter())
+    return ScanService(store)
+
+
+async def process_queued_run(store, run_id: str) -> Run:
+    """Consume one queued job end-to-end. Never leaves the run QUEUED/RUNNING."""
+    log_event("job_dispatch_started", run_id=run_id)
+    job_key = f"jobs/{run_id}.json"
+    run = store.get_run(run_id)
+    if run is None:
+        store.delete_json(job_key)
+        raise ValueError(f"Run {run_id} is missing")
+    if run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}:
+        log_event("job_already_terminal", run_id=run_id, status=run.status)
+        store.delete_json(job_key)
+        index_run(store, run)
+        return run
+
+    target = store.get_target(run.target_id)
+    log_event(
+        "job_target_loaded",
+        run_id=run_id,
+        target_id=run.target_id,
+        setup_status=getattr(target, "setup_status", None),
+        has_target=target is not None,
+    )
+    run.status = RunStatus.RUNNING
+    store.put_run(run)
+    index_run(store, run)
+    log_event("run_status_running", run_id=run_id, target_id=run.target_id)
+
+    try:
+        if target is None:
+            raise ValueError("Website configuration is missing")
+        service = _scan_service(store)
+        log_event(
+            "scan_service_ready",
+            run_id=run_id,
+            target_id=target.target_id,
+            browser=type(service.browser).__name__,
+            mode=os.getenv("CIVIC_CANARY_MODE", "local"),
+        )
+        run, findings = await service.run_local(target, run.trigger_type, run.run_id)
+        refreshed = store.get_target(target.target_id) or target
+        baseline = store.get_baseline(target.target_id)
+        log_event(
+            "job_dispatch_completed",
+            run_id=run_id,
+            target_id=target.target_id,
+            status=run.status,
+            setup_status=refreshed.setup_status,
+            baseline_saved=baseline is not None,
+            findings=len(findings),
+        )
+    except Exception as exc:
+        run = exc.run if isinstance(exc, RunExecutionError) else store.get_run(run_id) or run
+        run.status = RunStatus.FAILED
+        run.finished_at = datetime.now(UTC)
+        run.error_category = run.error_category or type(exc).__name__
+        run.summary = str(getattr(exc, "cause", exc) or exc)
+        store.put_run(run)
+        if target and target.setup_status in {"PENDING", "FAILED"}:
+            target.setup_status = "FAILED"
+            target.setup_run_id = run.run_id
+            store.put_target(target)
+        log_event(
+            "job_dispatch_failed",
+            run_id=run_id,
+            target_id=run.target_id,
+            error_category=run.error_category,
+            summary=run.summary,
+            setup_status=getattr(target, "setup_status", None),
+        )
+        index_run(store, run)
+        store.delete_json(job_key)
+        if isinstance(exc, RunExecutionError):
+            raise
+        raise RunExecutionError(run, exc) from exc
+
+    index_run(store, run)
+    store.delete_json(job_key)
     return run
 
 
@@ -60,8 +165,11 @@ async def run_due(store, now=None):
         job = store.get_json(key)
         if not job:
             continue
-        run = store.get_run(job["run_id"])
+        run_id = job["run_id"]
+        log_event("worker_claiming_job", run_id=run_id, job_key=key)
+        run = store.get_run(run_id)
         if not run:
+            store.delete_json(key)
             continue
         if run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}:
             index_run(store, run)
@@ -74,29 +182,27 @@ async def run_due(store, now=None):
             run.summary = "Previous worker stopped during this scan; schedule a fresh scan."
             run.finished_at = now
             store.put_run(run)
-            index_run(store, run)
-            store.delete_json(key)
-            continue
-        target = store.get_target(run.target_id)
-        try:
-            if target is None:
-                raise ValueError("Website configuration is missing")
-            run, _ = await ScanService(store).run_local(target, run.trigger_type, run.run_id)
-        except Exception as exc:
-            from agent.civic_canary.engine import RunExecutionError
-
-            run = exc.run if isinstance(exc, RunExecutionError) else run
-            run.status = RunStatus.FAILED
-            run.finished_at = datetime.now(UTC)
-            run.error_category = run.error_category or type(exc).__name__
-            run.summary = str(exc)
-            store.put_run(run)
+            target = store.get_target(run.target_id)
             if target and target.setup_status in {"PENDING", "FAILED"}:
                 target.setup_status = "FAILED"
                 store.put_target(target)
-        index_run(store, run)
-        store.delete_json(key)
+            log_event("worker_interrupted_run_failed", run_id=run_id)
+            index_run(store, run)
+            store.delete_json(key)
+            processed += 1
+            continue
+        try:
+            await process_queued_run(store, run_id)
+        except Exception as exc:
+            log_event(
+                "worker_job_error",
+                run_id=run_id,
+                error_category=type(exc).__name__,
+                summary=str(exc),
+            )
         processed += 1
     from services.notifications import deliver_pending
 
-    return {"processed": processed, "notifications": deliver_pending(store)}
+    result = {"processed": processed, "notifications": deliver_pending(store)}
+    log_event("worker_tick_completed", run_id="worker", **result)
+    return result
