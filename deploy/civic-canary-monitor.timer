@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Civic Canary due websites once per minute
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=civic-canary-monitor.service
+
+[Install]
+WantedBy=timers.target

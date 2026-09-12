@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import os
 import re
+import socket
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -32,6 +34,40 @@ class BrowserAdapter(ABC):
         raise NotImplementedError
 
 
+def validate_public_url(url: str) -> str:
+    """Reject credentials, unusual ports, non-public addresses and private DNS answers."""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or parsed.port not in {None, 443}
+    ):
+        raise UnsafeTargetError(
+            "Use a public HTTPS URL without credentials, fragments or custom ports"
+        )
+    host = parsed.hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise UnsafeTargetError("Private hosts are not supported")
+    try:
+        addresses = {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise UnsafeTargetError("Website hostname could not be resolved") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise UnsafeTargetError("Website resolves to a private or reserved address")
+    return url
+
+
+def page_url_for(target: PortalTarget, path: str) -> str:
+    base = target.start_url.replace("{version}", target.active_version)
+    # New websites preserve the exact submitted page, including its query string.
+    if path == "/" and "{version}" not in target.start_url:
+        return base
+    return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+
+
 def validate_target(target: PortalTarget, *, allow_local: bool = False) -> None:
     if not target.enabled:
         raise UnsafeTargetError("target is disabled")
@@ -40,11 +76,7 @@ def validate_target(target: PortalTarget, *, allow_local: bool = False) -> None:
         if not allow_local:
             raise UnsafeTargetError("fixture targets are only allowed in local/demo mode")
         forbidden = ("login", "log-in", "signin", "sign-in", "captcha", "upload")
-        if any(
-            term in step.path.lower()
-            for step in target.journey_steps
-            for term in forbidden
-        ):
+        if any(term in step.path.lower() for step in target.journey_steps for term in forbidden):
             raise UnsafeTargetError("login, CAPTCHA, and upload paths are not supported")
         return
     if parsed.scheme not in ({"https", "http"} if allow_local else {"https"}):
@@ -53,7 +85,7 @@ def validate_target(target: PortalTarget, *, allow_local: bool = False) -> None:
         raise UnsafeTargetError("target hostname is not allow-listed")
     validate_navigation_url(target.start_url, target.allowed_hosts, allow_http=allow_local)
     for step in target.journey_steps:
-        candidate = urljoin(target.start_url.rstrip("/") + "/", step.path.lstrip("/"))
+        candidate = page_url_for(target, step.path)
         validate_navigation_url(candidate, target.allowed_hosts, allow_http=allow_local)
 
 
@@ -65,6 +97,15 @@ def validate_navigation_url(
     allowed_schemes = {"https", "http"} if allow_http else {"https"}
     if parsed.scheme not in allowed_schemes:
         raise UnsafeTargetError("navigation must use an allowed web scheme")
+    if parsed.username or parsed.password or parsed.port not in {None, 443, 80}:
+        raise UnsafeTargetError("Credentials and custom ports are not supported")
+    if parsed.hostname:
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise UnsafeTargetError("Private addresses are not supported")
     allowed = {host.lower() for host in allowed_hosts}
     if not parsed.hostname or parsed.hostname.lower() not in allowed:
         raise UnsafeTargetError("navigation escaped the target allow-list")
@@ -99,7 +140,11 @@ def _page_from_html(
     link_status: Callable[[str], int],
 ) -> PageSnapshot:
     soup = BeautifulSoup(html, "html.parser")
-    for element in soup(["script", "style", "noscript"]):
+    link_soup = BeautifulSoup(html, "html.parser")
+    for element in soup.select(
+        "script,style,noscript,nav,footer,time,[role=navigation],"
+        "[id*=cookie],[class*=cookie],[aria-label*=cookie]"
+    ):
         element.decompose()
 
     headings = [_normalize_text(node.get_text(" ", strip=True)) for node in soup.select("h1,h2,h3")]
@@ -109,10 +154,13 @@ def _page_from_html(
     ]
     semantic_blocks = []
     seen_blocks: set[str] = set()
-    for node in soup.select("main h1,main h2,main h3,main p,main li"):
+    content_root = soup.select_one("main,article,[role=main]") or soup
+    for node in content_root.select("h1,h2,h3,p,li,td,dt,dd"):
         block = _normalize_text(node.get_text(" ", strip=True))
+        if re.fullmatch(r"(?:Last updated[: ]*)?\d{4}[-/]\d{2}[-/]\d{2}(?:[ T].*)?", block, re.I):
+            continue
         if block and block not in seen_blocks:
-            semantic_blocks.append(block)
+            semantic_blocks.append(block[:2000])
             seen_blocks.add(block)
     links = [
         LinkFact(
@@ -121,7 +169,7 @@ def _page_from_html(
             href=urljoin(url, node.get("href", "")),
             status=link_status(node.get("href", "")),
         )
-        for node in soup.select("a[href]")
+        for node in link_soup.select("a[href]")[:100]
     ]
 
     issues: list[AccessibilityIssue] = []
@@ -158,7 +206,7 @@ def _page_from_html(
         language=language,
         headings=headings,
         visible_text=_normalize_text(soup.get_text(" ", strip=True)),
-        semantic_blocks=semantic_blocks,
+        semantic_blocks=semantic_blocks[:100],
         requirements=requirements,
         links=links,
         accessibility_issues=issues,
@@ -221,12 +269,11 @@ class HttpBrowserAdapter(BrowserAdapter):
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target)
         pages: list[PageSnapshot] = []
-        base_url = target.start_url.replace("{version}", target.active_version)
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds, follow_redirects=False
         ) as client:
             for step in target.journey_steps:
-                page_url = urljoin(base_url.rstrip("/") + "/", step.path.lstrip("/"))
+                page_url = page_url_for(target, step.path)
                 validate_navigation_url(page_url, target.allowed_hosts)
                 response = None
                 for _ in range(6):
@@ -291,9 +338,7 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
         identifier: str | None = None,
     ) -> None:
         self.region = (
-            region
-            or os.getenv("AWS_REGION")
-            or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+            region or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         )
         self.identifier = identifier or os.getenv("AGENTCORE_BROWSER_ID")
         if not self.identifier:
@@ -301,6 +346,9 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
 
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target)
+        await asyncio.to_thread(
+            validate_public_url, target.start_url.replace("{version}", target.active_version)
+        )
         return await asyncio.to_thread(self._capture_sync, target, run_id)
 
     def _capture_sync(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
@@ -314,12 +362,22 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
         if not axe_path.is_file():
             raise RuntimeError("bundled axe-core script is missing from the runtime")
         axe_source = axe_path.read_text(encoding="utf-8")
-        with browser_session(
-            self.region, identifier=self.identifier
-        ) as client, sync_playwright() as playwright:
+        with (
+            browser_session(self.region, identifier=self.identifier) as client,
+            sync_playwright() as playwright,
+        ):
+            from services.observability import log_event
+
+            log_event(
+                "browser_session_started",
+                run_id=run_id,
+                target_id=target.target_id,
+                browser_session_id=client.session_id,
+            )
             ws_url, headers = client.generate_ws_headers()
             browser = playwright.chromium.connect_over_cdp(ws_url, headers=headers)
             context = browser.new_context(service_workers="block")
+
             def guard_route(route) -> None:
                 request = route.request
                 unsafe_resource = request.resource_type in {"websocket", "serviceworker"}
@@ -329,15 +387,22 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                 if unsafe_resource or unsafe_request:
                     route.abort("blockedbyclient")
                     return
+                try:
+                    if urlparse(request.url).scheme == "https":
+                        validate_public_url(request.url.split("#")[0])
+                except (ValueError, OSError):
+                    route.abort("blockedbyclient")
+                    return
                 route.continue_()
 
+            context.set_default_timeout(20000)
+            context.set_default_navigation_timeout(30000)
             context.route("**/*", guard_route)
             page = context.pages[0] if context.pages else context.new_page()
             context.on("page", lambda popup: popup.close())
             try:
-                base_url = target.start_url.replace("{version}", target.active_version)
                 for index, step in enumerate(target.journey_steps):
-                    page_url = urljoin(base_url.rstrip("/") + "/", step.path.lstrip("/"))
+                    page_url = page_url_for(target, step.path)
                     validate_navigation_url(page_url, target.allowed_hosts)
                     response = page.goto(page_url, wait_until="networkidle")
                     validate_navigation_url(page.url, target.allowed_hosts)
@@ -350,7 +415,7 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                     html = page.content()
                     soup = BeautifulSoup(html, "html.parser")
                     statuses: dict[str, int] = {}
-                    for anchor in soup.select("a[href]"):
+                    for anchor in soup.select("a[href]")[:20]:
                         href = anchor.get("href", "")
                         linked = urljoin(page.url, href)
                         if not href or href.startswith(("#", "mailto:", "tel:")):
@@ -359,14 +424,16 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                             statuses[href] = 403
                         else:
                             try:
+                                validate_public_url(linked.split("#")[0])
                                 linked_response = context.request.head(
-                                    linked, max_redirects=0
+                                    linked, max_redirects=0, timeout=1500
                                 )
                                 if linked_response.status in {405, 501}:
                                     linked_response = context.request.get(
                                         linked,
                                         headers={"Range": "bytes=0-0"},
                                         max_redirects=0,
+                                        timeout=1500,
                                     )
                                 statuses[href] = linked_response.status
                             except Exception:
@@ -377,8 +444,7 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                         link_status=lambda href, checked=statuses: checked.get(href, 599),
                     )
                     known_issues = {
-                        (issue.rule, issue.selector)
-                        for issue in captured_page.accessibility_issues
+                        (issue.rule, issue.selector) for issue in captured_page.accessibility_issues
                     }
                     severity_map = {
                         "minor": Severity.LOW,
@@ -408,12 +474,16 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                             )
                     slug = re.sub(r"[^a-z0-9]+", "-", step.label.lower()).strip("-")
                     screenshot_prefix = (
-                        f"baselines/{target.target_id}/screenshots"
+                        f"baselines/{target.target_id}/{run_id}/screenshots"
                         if run_id.startswith("baseline")
                         else f"screenshots/{target.target_id}/{run_id}"
                     )
                     page_screenshot_key = f"{screenshot_prefix}/{index + 1}-{slug}.png"
                     bucket = os.getenv("EVIDENCE_BUCKET") or os.getenv("CIVIC_CANARY_S3_BUCKET")
+                    if not bucket:
+                        raise RuntimeError(
+                            "CIVIC_CANARY_S3_BUCKET is required for browser evidence"
+                        )
                     if bucket:
                         boto3.client("s3", region_name=self.region).put_object(
                             Bucket=bucket,
@@ -451,18 +521,11 @@ def create_browser_adapter(
         if not resolved_identifier:
             raise ValueError("AGENTCORE_BROWSER_ID is required when BROWSER_MODE=agentcore")
         resolved_region = (
-            region
-            or os.getenv("AWS_REGION")
-            or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+            region or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         )
-        return AgentCoreBrowserAdapter(
-            region=resolved_region, identifier=resolved_identifier
-        )
+        return AgentCoreBrowserAdapter(region=resolved_region, identifier=resolved_identifier)
     if selected_mode == "local":
-        root = (
-            fixture_root
-            or (Path(__file__).resolve().parents[2] / "web" / "public" / "portal")
-        )
+        root = fixture_root or (Path(__file__).resolve().parents[2] / "web" / "public" / "portal")
         return FixtureBrowserAdapter(root)
     if selected_mode == "http":
         return HttpBrowserAdapter()

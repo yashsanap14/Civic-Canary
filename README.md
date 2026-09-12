@@ -5,8 +5,37 @@ content and accessibility regressions. It captures a safe, read-only snapshot, c
 approved baseline, identifies nonprofit guidance affected by the change, and drafts a correction
 for a human reviewer.
 
-The repository contains a working local MVP and deployment-ready AWS infrastructure. No AWS
-environment is currently deployed from this repository.
+The repository contains a working local MVP and an AWS deployment hosted on Amazon EC2.
+
+## Deployed AWS workflow
+
+We built and deployed **Civic Canary**, an AWS-based monitoring system that detects meaningful
+changes on public-benefit websites and turns those changes into actionable findings for nonprofit
+teams. The application is hosted on **Amazon EC2** with a **FastAPI backend** and a **React
+frontend served through Nginx**, while **Amazon CloudFront** provides the public HTTPS endpoint.
+The monitored demo portal uses versioned pages such as V1 and V2 so the system can compare a known
+baseline against an updated version. The EC2 instance uses an **IAM role** to securely access AWS
+services without storing permanent access keys.
+
+For automated website monitoring, Civic Canary uses **Amazon Bedrock AgentCore Browser** to launch
+browser sessions and capture the monitored pages. The browser visits the portal through the
+CloudFront HTTPS URL, captures page content and screenshots, and runs accessibility checks using
+**axe-core**. The system successfully detected both a new policy requirement and an accessibility
+issue: a newly required “Current benefit award letter” and a form field without an accessible
+label. The application also uses **Amazon Bedrock** and the project's AI/agent workflow to analyze
+detected changes, determine materiality and severity, map them to affected playbook sections, and
+generate proposed remediation text.
+
+For persistent storage, the application connects to **Amazon DynamoDB** and **Amazon S3**.
+`CivicCanarySites` stores monitored-site configuration, `CivicCanaryFindings` stores structured
+findings, and `CivicCanaryReviews` supports the human approval/rejection workflow. **Amazon S3**
+stores the nonprofit playbook, scan records, baselines, snapshots, screenshots, evidence, and
+AgentCore Browser recordings. We verified that successful scans return `200 OK`, AgentCore Browser
+sessions are running, findings are written to DynamoDB, and supporting evidence is stored in S3.
+This provides an end-to-end AWS workflow:
+
+**Website monitoring → browser capture → AI analysis → evidence storage → structured findings →
+human review.**
 
 ## Demo scenario
 
@@ -43,30 +72,87 @@ Civic Canary does not:
 - navigate outside a target's exact host allow-list;
 - publish corrections without human approval.
 
-## Architecture
+## Deployed architecture and monitoring upgrade
+
+The deployed foundation reported by the owner is CloudFront, Nginx/React/FastAPI on
+EC2, AgentCore Browser, Bedrock, the three existing DynamoDB tables and S3. This
+upgrade adds a shared production Strands graph and an EC2 background worker. Activate
+the worker and SES notifications using [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md).
+Those upgrade components have been implemented locally, not verified in the AWS account.
 
 ```mermaid
 flowchart LR
-    UI[React reviewer UI] --> API[FastAPI control API]
-    API -->|queue scan| WORKER[Scan Lambda]
-    SCHEDULE[EventBridge Scheduler] --> WORKER
-    WORKER --> RUNTIME[AgentCore Runtime]
-    RUNTIME --> BROWSER[AgentCore Browser]
-    RUNTIME --> GRAPH[Strands graph]
-    GRAPH --> DIFF[Semantic diff]
-    GRAPH --> A11Y[Accessibility audit]
-    DIFF --> IMPACT[Playbook impact mapping]
-    A11Y --> IMPACT
-    IMPACT --> DRAFT[Safe repair draft]
-    RUNTIME --> DB[(DynamoDB)]
-    RUNTIME --> EVIDENCE[(S3 evidence)]
-    API --> DB
-    API --> EVIDENCE
+    USER[Nonprofit reviewer] --> CF[CloudFront HTTPS]
+    CF --> NGINX[Nginx on EC2]
+    NGINX --> UI[React decision dashboard]
+    NGINX --> API[FastAPI]
+    API --> JOBS[(S3 durable scan jobs)]
+    TIMER[EC2 systemd timer: activate with upgrade] --> WORKER[Single background worker]
+    JOBS --> WORKER
+    WORKER --> GRAPH[Strands graph]
+    GRAPH --> COLLECT[Evidence collection tool]
+    COLLECT --> BROWSER[AgentCore Browser]
+    GRAPH --> CLASSIFY[Change and relevance analysis]
+    CLASSIFY --> DRAFT[Reviewer packet draft]
+    DRAFT --> VERIFY[Grounding verification]
+    GRAPH --> BEDROCK[Amazon Bedrock]
+    VERIFY --> DB[(Existing Sites / Findings / Reviews)]
+    COLLECT --> S3[(S3 snapshots and screenshots)]
+    VERIFY --> S3
+    WORKER --> OUTBOX[(S3 deduplicated decision outbox)]
+    OUTBOX --> SES[SES: activate with upgrade]
+    SES --> USER
+    API --> REVIEW[Atomic human review]
+    REVIEW --> DB
+    REVIEW --> ARTIFACT[(S3 approved guidance artifact)]
 ```
 
-Critical facts are extracted and compared deterministically. The model validates meaning and drafts
-the correction, but malformed model output is never silently accepted. A failed scan is recorded as
-a failed run and does not create an actionable finding.
+Production scans always execute `agent/civic_canary/reasoning.py`. The graph owns the
+browser collection tool, classifies objective-relevant changes, drafts a grounded
+packet, and verifies its claims. Exact evidence quotations and current-guidance quotes
+are validated before saving findings. The UI displays that validated proposed patch.
+Model/browser failure records a failed run; there is no production deterministic bypass.
+The deterministic V1/V2 fixture engine remains available in local mode.
+
+**Optional architecture:** EventBridge, Lambda, API Gateway and AgentCore Runtime
+remain in the repository as an alternative deployment. They are not represented as
+active EC2 components. The optional Runtime entrypoint now shares the production scan
+service. Do not deploy both scheduling paths without designing cross-worker locking.
+
+## Add a website and review a decision
+
+1. Enter your reviewer token and choose **Connect / refresh**.
+2. Choose **Add Website**. Supply its HTTPS URL, name, objective, category, frequency,
+   and optional guidance. The exact submitted page is monitored, not an unlimited crawl.
+3. The background worker runs AgentCore Browser and Strands, stores the first baseline,
+   and recommends headings based on captured evidence. Refresh to see setup progress.
+4. Accept or edit the sections and choose **Confirm monitoring**.
+5. Close the dashboard. The EC2 timer checks each site's due time. No material change
+   means no notification. A new actionable finding creates a deduplicated outbox event.
+6. Open the authenticated decision link. Review what changed, before/after evidence,
+   impact, affected people, current/proposed guidance, severity and agent confidence.
+7. Approve or reject with notes. Approval produces a downloadable Markdown artifact;
+   it never edits a public website automatically. The audit record retains the original
+   recommendation, evidence references, timestamp, reviewer identity and run ID.
+
+Run detail shows the reasoning engine, model ID, graph node timings and notification
+status. Browser session logs include that same run ID. Agent confidence is self-assessed,
+not calibrated accuracy. All AWS-mode data/evidence reads require the reviewer token.
+
+## Evaluation and submission evidence
+
+```bash
+uv run python -m scripts.evaluate --output evaluation-results.json
+# Optional: uses real Bedrock calls against fixed HTML cases and incurs AWS usage.
+uv run python -m scripts.evaluate --live-model --output live-evaluation-results.json
+```
+
+The offline suite checks two different page structures, meaningful/irrelevant/no-change
+content, ambiguous changes, deduplication, SSRF rejection, model/browser failures,
+notification behavior and atomic review. It also exercises the actual Strands SDK graph
+with a mocked model transport. Offline pass rates are contract checks, not model accuracy
+or live AWS uptime. Real-model accuracy and human review time remain unmeasured until
+those evaluations are run. Follow [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md) before submission.
 
 ## Repository layout
 
@@ -161,7 +247,7 @@ failure handling.
 
 ## API
 
-Public, sanitized reads:
+Reads (public in local fixture mode; reviewer-token protected in AWS mode):
 
 - `GET /api/health`
 - `GET /api/targets`
@@ -182,11 +268,10 @@ For the existing CivicCanarySites, CivicCanaryFindings, CivicCanaryReviews table
 civic-canary bucket, follow [Existing AWS storage](EXISTING_AWS_STORAGE.md).
 That path needs no new tables or CDK deployment.
 
-The production design targets `us-east-1` and uses Bedrock, AgentCore Runtime and Browser, Lambda,
-API Gateway, DynamoDB, S3, Secrets Manager, Systems Manager Parameter Store, EventBridge Scheduler,
-CloudWatch, IAM, and AWS Budgets.
+The optional CDK deployment targets `us-east-1`. Its Lambda/API Gateway/Runtime path is
+separate from the EC2 deployment described above.
 
-The deployment owner should follow [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md). It includes the required
+For the optional CDK deployment, follow [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md). It includes the required
 permissions, model and quota checks, reviewer-token setup, estimated costs, deployment commands,
 acceptance tests, troubleshooting, and complete cleanup instructions.
 
@@ -206,71 +291,10 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Existing AWS storage and EC2 redeployment
 
-The AWS store uses existing tables; it does not create tables or buckets. Configure:
+Use [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md) for the authoritative EC2 activation
+steps, environment variables, role permissions, SES setup, timer installation, history
+backfill and migration limits. No new DynamoDB tables are required. The existing
+storage adapter remains compatible; new API decisions use atomic finding/review writes.
 
-```dotenv
-CIVIC_CANARY_MODE=aws
-AWS_REGION=us-east-1
-CIVIC_CANARY_SITES_TABLE=CivicCanarySites
-CIVIC_CANARY_FINDINGS_TABLE=CivicCanaryFindings
-CIVIC_CANARY_REVIEWS_TABLE=CivicCanaryReviews
-CIVIC_CANARY_S3_BUCKET=civic-canary
-```
-
-Site and finding partition keys are `siteId` and `findingId`. Domain models and API
-responses retain `target_id` and `finding_id`. Reviews use `reviewId`, `findingId`,
-`action` (APPROVED/REJECTED), `reviewedAt`, `reviewer`, and `notes`. The API records a
-SHA-256 token identity rather than the raw reviewer token.
-
-Runs persist at `s3://civic-canary/runs/{run_id}.json`; Recent Runs lists these objects
-across all pages and sorts newest first. Conditional S3 writes prevent duplicate run
-creation. Existing `baselines/`, `snapshots/`, `evidence/`, and `approved/` storage
-behavior is preserved. Local mode still uses InMemoryStore.
-
-Remove legacy targets/runs table variables. If using `/civic-canary/storage-config`
-in SSM, update its keys to `sites_table`, `findings_table`, `reviews_table`, and
-`evidence_bucket`; old targets/runs keys are ignored. Explicit environment values take
-precedence. The EC2 instance role needs DynamoDB GetItem, PutItem, Scan on the three
-tables, S3 GetObject/PutObject on `civic-canary/*`, and S3 ListBucket on `civic-canary`.
-See `infra/agentcore-runtime-policy.json` for the storage permissions.
-
-Migration: existing records with the required camelCase keys need no key migration;
-they must still contain the domain model's other required fields. Redundant legacy
-ID attributes are ignored in favor of the partition key and removed on the next write.
-Data in older tables or buckets is not copied automatically. Export old run models to
-`runs/{run_id}.json` in the existing bucket if that history must remain visible. Copy
-old baseline/evidence objects preserving their paths if moving from another bucket.
-No AWS resources or stored data were modified by this code change.
-
-The CDK stack now imports the existing resources. **If upgrading a previously deployed
-CDK stack, first retain and back up its old storage resources before removing them
-from CloudFormation**: the old definitions used DESTROY and S3 auto-delete. Review
-`cdk diff` before deployment. EC2 code redeployment does not require CDK deployment.
-
-On EC2, after committing and pushing this change, use the following commands. Replace
-`/path/to/Civic-Canary` and `civic-canary.service` with your checkout and existing
-systemd unit (the repository does not define an EC2 unit):
-
-```bash
-cd /path/to/Civic-Canary
-git pull --ff-only
-# Edit .env with the values above; retain your reviewer/browser/model settings.
-nano .env
-uv sync --extra dev
-npm --prefix web ci
-npm --prefix web run build
-uv run --extra dev pytest -q
-# The systemd unit must load this checkout's .env via EnvironmentFile.
-sudo systemctl restart civic-canary.service
-sudo systemctl status civic-canary.service --no-pager
-curl --fail http://127.0.0.1:8000/api/health
-```
-
-For a foreground deployment without systemd, start the API with the environment loaded:
-
-```bash
-set -a
-source .env
-set +a
-uv run uvicorn services.control_api.app:app --host 0.0.0.0 --port 8000
-```
+Before updating any previously deployed CDK stack, retain its old storage resources:
+legacy definitions used destructive removal policies. EC2 activation does not require CDK.

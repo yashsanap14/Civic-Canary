@@ -109,6 +109,40 @@ class Store(ABC):
     @abstractmethod
     def evidence_url(self, key: str) -> str | None: ...
 
+    def commit_review(self, finding: Finding, expected_status: FindingStatus) -> bool:
+        raise NotImplementedError
+
+    def put_json_once(self, key: str, value: dict) -> bool:
+        raise NotImplementedError
+
+    def put_json(self, key: str, value: dict) -> None:
+        raise NotImplementedError
+
+    def get_json(self, key: str) -> dict | None:
+        raise NotImplementedError
+
+    def list_json_keys(self, prefix: str, limit: int = 50) -> list[str]:
+        raise NotImplementedError
+
+    def delete_json(self, key: str) -> None:
+        raise NotImplementedError
+
+    def read_artifact(self, key: str) -> str:
+        raise NotImplementedError
+
+    def target_page(
+        self, limit: int = 50, cursor: dict | None = None
+    ) -> tuple[list[PortalTarget], dict | None]:
+        return self.list_targets()[:limit], None
+
+    def finding_page(
+        self, limit: int = 50, cursor: dict | None = None
+    ) -> tuple[list[Finding], dict | None]:
+        return self.list_findings()[:limit], None
+
+    def recent_runs(self, limit: int = 50) -> list[Run]:
+        return self.list_runs()[:limit]
+
 
 class InMemoryStore(Store):
     def __init__(self, playbook: str = "") -> None:
@@ -120,6 +154,7 @@ class InMemoryStore(Store):
         self.reviews: dict[str, dict[str, Any]] = {}
         self.artifacts: dict[str, str] = {}
         self.playbook = playbook
+        self.json_objects: dict[str, dict] = {}
         self._lock = RLock()
 
     def get_target(self, target_id: str) -> PortalTarget | None:
@@ -234,6 +269,36 @@ class InMemoryStore(Store):
     def evidence_url(self, key: str) -> str | None:
         return None
 
+    def commit_review(self, finding: Finding, expected_status: FindingStatus) -> bool:
+        with self._lock:
+            if not self.transition_finding(finding, expected_status):
+                return False
+            self.reviews[f"review-{finding.finding_id}"] = review_item(finding)
+            return True
+
+    def put_json_once(self, key: str, value: dict) -> bool:
+        with self._lock:
+            if key in self.json_objects:
+                return False
+            self.put_json(key, value)
+            return True
+
+    def put_json(self, key: str, value: dict) -> None:
+        self.json_objects[key] = json.loads(json.dumps(value))
+
+    def get_json(self, key: str) -> dict | None:
+        value = self.json_objects.get(key)
+        return json.loads(json.dumps(value)) if value is not None else None
+
+    def list_json_keys(self, prefix: str, limit: int = 50) -> list[str]:
+        return sorted(key for key in self.json_objects if key.startswith(prefix))[:limit]
+
+    def delete_json(self, key: str) -> None:
+        self.json_objects.pop(key, None)
+
+    def read_artifact(self, key: str) -> str:
+        return self.artifacts[key]
+
 
 class AwsStore(Store):
     def __init__(
@@ -251,6 +316,7 @@ class AwsStore(Store):
         self.s3 = boto3.client("s3", region_name=region)
         self.bucket = evidence_bucket
         self.region = region
+        self.ddb = boto3.client("dynamodb", region_name=region)
 
     def get_target(self, target_id: str) -> PortalTarget | None:
         item = self.sites.get_item(Key={"siteId": target_id}).get("Item")
@@ -427,6 +493,8 @@ class AwsStore(Store):
         key = f"approved/{finding.finding_id}.md"
         content = (
             f"# Approved Civic Canary patch\n\n{finding.proposed_patch}\n\n"
+            f"Run: {finding.run_id}\nReviewer: {finding.reviewed_by}\n"
+            f"Decision time: {finding.decided_at}\nEvidence: {finding.evidence}\n\n"
             "This reviewed draft was not published automatically.\n"
         )
         self.s3.put_object(
@@ -463,6 +531,117 @@ class AwsStore(Store):
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=300,
         )
+
+    def commit_review(self, finding: Finding, expected_status: FindingStatus) -> bool:
+        from boto3.dynamodb.types import TypeSerializer
+
+        serializer = TypeSerializer()
+
+        def wire(value):
+            return {key: serializer.serialize(item) for key, item in _to_dynamo(value).items()}
+
+        item = _dynamo_item(finding)
+        item["findingId"] = item.pop("finding_id")
+        try:
+            self.ddb.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.findings.name,
+                            "Item": wire(item),
+                            "ConditionExpression": "#s = :expected",
+                            "ExpressionAttributeNames": {"#s": "status"},
+                            "ExpressionAttributeValues": {
+                                ":expected": {"S": expected_status.value}
+                            },
+                        }
+                    },
+                    {
+                        "Put": {
+                            "TableName": self.reviews.name,
+                            "Item": wire(review_item(finding)),
+                            "ConditionExpression": "attribute_not_exists(reviewId)",
+                        }
+                    },
+                ]
+            )
+            return True
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "TransactionCanceledException" and any(
+                reason.get("Code") == "ConditionalCheckFailed"
+                for reason in exc.response.get("CancellationReasons", [])
+            ):
+                return False
+            raise
+
+    def put_json_once(self, key: str, value: dict) -> bool:
+        try:
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=json.dumps(value).encode(),
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+            return True
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {"PreconditionFailed", "412"}:
+                return False
+            raise
+
+    def put_json(self, key: str, value: dict) -> None:
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=json.dumps(value).encode(),
+            ContentType="application/json",
+        )
+
+    def get_json(self, key: str) -> dict | None:
+        try:
+            return json.loads(self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read())
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] in {"NoSuchKey", "404"}:
+                return None
+            raise
+
+    def list_json_keys(self, prefix: str, limit: int = 50) -> list[str]:
+        response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=limit)
+        return [item["Key"] for item in response.get("Contents", [])]
+
+    def delete_json(self, key: str) -> None:
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def read_artifact(self, key: str) -> str:
+        return self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read().decode()
+
+    def target_page(self, limit: int = 50, cursor: dict | None = None):
+        options = {"Limit": limit}
+        if cursor:
+            options["ExclusiveStartKey"] = cursor
+        response = self.sites.scan(**options)
+        rows = [
+            PortalTarget.model_validate({**_from_dynamo(item), "target_id": item["siteId"]})
+            for item in response.get("Items", [])
+        ]
+        return rows, response.get("LastEvaluatedKey")
+
+    def finding_page(self, limit: int = 50, cursor: dict | None = None):
+        options = {"Limit": limit}
+        if cursor:
+            options["ExclusiveStartKey"] = cursor
+        response = self.findings.scan(**options)
+        rows = [
+            Finding.model_validate({**_from_dynamo(item), "finding_id": item["findingId"]})
+            for item in response.get("Items", [])
+        ]
+        return rows, response.get("LastEvaluatedKey")
+
+    def recent_runs(self, limit: int = 50) -> list[Run]:
+        return [
+            Run.model_validate(self.get_json(key))
+            for key in self.list_json_keys("recent-runs/", limit)
+        ]
 
 
 class ExistingAwsStore(AwsStore):
@@ -505,12 +684,12 @@ class ExistingAwsStore(AwsStore):
         return item
 
     def get_target(self, target_id: str) -> PortalTarget | None:
-        item = self.sites.get_item(
-            Key={"siteId": target_id}, ConsistentRead=True
-        ).get("Item")
-        return PortalTarget.model_validate(
-            {**_from_dynamo(item), "target_id": item["siteId"]}
-        ) if item else None
+        item = self.sites.get_item(Key={"siteId": target_id}, ConsistentRead=True).get("Item")
+        return (
+            PortalTarget.model_validate({**_from_dynamo(item), "target_id": item["siteId"]})
+            if item
+            else None
+        )
 
     def record_review(
         self, finding_id: str, action: str, note: str = "", reviewer: str = "reviewer"
@@ -524,15 +703,19 @@ class ExistingAwsStore(AwsStore):
 
     def put_run(self, run: Run) -> None:
         self.s3.put_object(
-            Bucket=self.bucket, Key=self._run_key(run.run_id),
-            Body=run.model_dump_json().encode(), ContentType="application/json",
+            Bucket=self.bucket,
+            Key=self._run_key(run.run_id),
+            Body=run.model_dump_json().encode(),
+            ContentType="application/json",
         )
 
     def create_run(self, run: Run) -> bool:
         try:
             self.s3.put_object(
-                Bucket=self.bucket, Key=self._run_key(run.run_id),
-                Body=run.model_dump_json().encode(), ContentType="application/json",
+                Bucket=self.bucket,
+                Key=self._run_key(run.run_id),
+                Body=run.model_dump_json().encode(),
+                ContentType="application/json",
                 IfNoneMatch="*",
             )
             return True
@@ -561,7 +744,8 @@ class ExistingAwsStore(AwsStore):
                 response = self.s3.get_object(Bucket=self.bucket, Key=item["Key"])
                 runs.append(Run.model_validate_json(response["Body"].read()))
         return sorted(
-            runs, key=lambda run: run.started_at or datetime.min.replace(tzinfo=UTC),
+            runs,
+            key=lambda run: run.started_at or datetime.min.replace(tzinfo=UTC),
             reverse=True,
         )
 
@@ -575,33 +759,41 @@ class ExistingAwsStore(AwsStore):
         def serialize(item: dict) -> dict:
             return {key: serializer.serialize(value) for key, value in item.items()}
 
-        review = _to_dynamo({
-            "reviewId": f"review-{finding.finding_id}",
-            "findingId": finding.finding_id,
-            "siteId": finding.target_id,
-            "runId": finding.run_id,
-            "action": "APPROVE" if finding.status == FindingStatus.APPROVED else "REJECT",
-            "note": finding.decision_note,
-            "decidedAt": finding.decided_at.isoformat() if finding.decided_at else None,
-            "approvedArtifactKey": finding.approved_artifact_key,
-        })
+        review = _to_dynamo(
+            {
+                "reviewId": f"review-{finding.finding_id}",
+                "findingId": finding.finding_id,
+                "siteId": finding.target_id,
+                "runId": finding.run_id,
+                "action": "APPROVE" if finding.status == FindingStatus.APPROVED else "REJECT",
+                "note": finding.decision_note,
+                "decidedAt": finding.decided_at.isoformat() if finding.decided_at else None,
+                "approvedArtifactKey": finding.approved_artifact_key,
+            }
+        )
         try:
-            self.ddb.transact_write_items(TransactItems=[
-                {"Put": {
-                    "TableName": self.findings.name,
-                    "Item": serialize(self._finding_item(finding)),
-                    "ConditionExpression": "#s = :expected",
-                    "ExpressionAttributeNames": {"#s": "status"},
-                    "ExpressionAttributeValues": {
-                        ":expected": serializer.serialize(expected_status.value)
+            self.ddb.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": self.findings.name,
+                            "Item": serialize(self._finding_item(finding)),
+                            "ConditionExpression": "#s = :expected",
+                            "ExpressionAttributeNames": {"#s": "status"},
+                            "ExpressionAttributeValues": {
+                                ":expected": serializer.serialize(expected_status.value)
+                            },
+                        }
                     },
-                }},
-                {"Put": {
-                    "TableName": self.reviews.name,
-                    "Item": serialize(review),
-                    "ConditionExpression": "attribute_not_exists(reviewId)",
-                }},
-            ])
+                    {
+                        "Put": {
+                            "TableName": self.reviews.name,
+                            "Item": serialize(review),
+                            "ConditionExpression": "attribute_not_exists(reviewId)",
+                        }
+                    },
+                ]
+            )
             return True
         except ClientError as exc:
             reasons = exc.response.get("CancellationReasons", [])
@@ -610,3 +802,22 @@ class ExistingAwsStore(AwsStore):
             ):
                 return False
             raise
+
+
+def review_item(finding: Finding) -> dict:
+    return {
+        "reviewId": f"review-{finding.finding_id}",
+        "findingId": finding.finding_id,
+        "siteId": finding.target_id,
+        "runId": finding.run_id,
+        "action": finding.status.value,
+        "reviewedAt": finding.decided_at.isoformat()
+        if finding.decided_at
+        else datetime.now(UTC).isoformat(),
+        "reviewer": finding.reviewed_by or "reviewer",
+        "notes": finding.decision_note,
+        "originalRecommendation": finding.proposed_patch,
+        "evidence": finding.evidence,
+        "evidenceKeys": finding.evidence_keys,
+        "approvedArtifactKey": finding.approved_artifact_key,
+    }

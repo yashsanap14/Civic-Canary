@@ -1,0 +1,22 @@
+[Unit]
+Description=Civic Canary due website scans and decision notifications
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=civiccanary
+Group=civiccanary
+WorkingDirectory=/opt/civic-canary
+EnvironmentFile=/etc/civic-canary.env
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=civic-canary
+ExecStart=/usr/bin/flock -n /var/lib/civic-canary/worker.lock /opt/civic-canary/.venv/bin/python -m scripts.monitor_due
+TimeoutStartSec=1800
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

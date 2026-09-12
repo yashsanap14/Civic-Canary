@@ -3,6 +3,15 @@ export type Target = {
   name: string
   active_version: 'v1' | 'v2'
   enabled: boolean
+  start_url?: string
+  description?: string
+  monitoring_objective?: string
+  scan_frequency_minutes?: number
+  recommended_sections?: string[]
+  monitored_sections?: string[]
+  setup_status?: 'ACTIVE' | 'PENDING' | 'AWAITING_CONFIRMATION' | 'FAILED'
+  setup_run_id?: string
+  next_scan_at?: string
 }
 
 export type NodeTiming = {
@@ -21,6 +30,9 @@ export type Run = {
   node_timings: NodeTiming[]
   summary: string
   error_category: string | null
+  reasoning_source?: string
+  review_memo?: { run_id: string; engine: string; model_id: string; packet: { summary: string } }
+  notification_status?: string
 }
 
 export type Finding = {
@@ -40,6 +52,15 @@ export type Finding = {
   status: 'OPEN' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED'
   created_at: string
   decision_note: string | null
+  before?: string
+  after?: string
+  why_it_matters?: string
+  affected_people?: string
+  current_guidance?: string
+  agent_confidence?: number
+  reasoning_source?: string
+  reviewed_by?: string
+  decided_at?: string
 }
 
 declare global {
@@ -72,23 +93,42 @@ function protectedHeaders(token: string) {
 }
 
 export const api = {
-  targets: () => request<Target[]>('/api/targets'),
-  runs: () => request<Run[]>('/api/runs'),
-  run: (runId: string) => request<Run>(`/api/runs/${runId}`),
-  findings: () => request<Finding[]>('/api/findings'),
-  finding: (findingId: string) => request<Finding>(`/api/findings/${findingId}`),
-  setVersion: (version: 'v1' | 'v2', token: string) =>
+  targets: (token = '') => request<Target[]>('/api/targets', { headers: protectedHeaders(token) }),
+  runs: (token = '') => request<Run[]>('/api/runs', { headers: protectedHeaders(token) }),
+  run: (runId: string, token = '') => request<Run>(`/api/runs/${runId}`, { headers: protectedHeaders(token) }),
+  findings: (token = '') => request<Finding[]>('/api/findings', { headers: protectedHeaders(token) }),
+  finding: (findingId: string, token = '') => request<Finding>(`/api/findings/${findingId}`, { headers: protectedHeaders(token) }),
+  setVersion: (version: 'v1' | 'v2', token: string, targetId = 'benefits-demo') =>
     request<Target>('/api/demo/version', {
       method: 'POST',
       headers: protectedHeaders(token),
-      body: JSON.stringify({ target_id: 'benefits-demo', version }),
+      body: JSON.stringify({ target_id: targetId, version }),
     }),
-  startRun: (token: string) =>
+  startRun: (token: string, targetId = 'benefits-demo') =>
     request<{ run: Run; findings: Finding[] }>('/api/runs', {
       method: 'POST',
       headers: protectedHeaders(token),
-      body: JSON.stringify({ target_id: 'benefits-demo' }),
+      body: JSON.stringify({ target_id: targetId }),
     }),
+  addWebsite: (data: Record<string, unknown>, token: string) => request<Target>('/api/targets', {
+    method: 'POST', headers: protectedHeaders(token), body: JSON.stringify(data),
+  }),
+  confirm: (id: string, sections: string[], token: string) => request<Target>(`/api/targets/${id}/confirm`, {
+    method: 'POST', headers: protectedHeaders(token), body: JSON.stringify({ monitored_sections: sections }),
+  }),
+  inspect: (id: string, token: string) => request<{ run: Run }>(`/api/targets/${id}/inspect`, {
+    method: 'POST', headers: protectedHeaders(token),
+  }),
+  download: async (id: string, token: string) => {
+    const response = await fetch(`${baseUrl}/api/findings/${id}/artifact`, { headers: protectedHeaders(token) })
+    if (!response.ok) throw new Error('Approved artifact could not be downloaded')
+    const url = URL.createObjectURL(await response.blob())
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = 'approved-guidance.md'
+    anchor.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  },
   decide: (findingId: string, action: 'APPROVE' | 'REJECT', note: string, token: string) =>
     request<{ finding: Finding; approved_artifact_key: string | null }>(
       `/api/findings/${findingId}/decision`,

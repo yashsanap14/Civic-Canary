@@ -1,0 +1,51 @@
+[
+  {
+    "name": "benefits_requirement",
+    "site": "benefits",
+    "before": "<main><h1>Family Assistance</h1><p>Bring proof of identity.</p></main>",
+    "after": "<main><h1>Family Assistance</h1><p>Bring proof of identity and a current award letter.</p></main>",
+    "objective": "Required documents for family assistance",
+    "expected_actionable": true
+  },
+  {
+    "name": "library_contact",
+    "site": "library",
+    "before": "<article><h2>Home delivery</h2><dl><dt>Contact</dt><dd>Call 555-0101 for accessible delivery.</dd></dl></article>",
+    "after": "<article><h2>Home delivery</h2><dl><dt>Contact</dt><dd>Call 555-0102 for accessible delivery.</dd></dl></article>",
+    "objective": "Accessible library delivery contact details",
+    "expected_actionable": true
+  },
+  {
+    "name": "benefits_no_change",
+    "site": "benefits",
+    "before": "<main><h1>Family Assistance</h1><p>Bring proof of identity.</p></main>",
+    "after": "<main><h1>Family Assistance</h1><p>Bring proof of identity.</p></main>",
+    "objective": "Required documents",
+    "expected_actionable": false
+  },
+  {
+    "name": "library_noise",
+    "site": "library",
+    "before": "<nav>Home Books</nav><article><h2>Home delivery</h2><p>Call 555-0101.</p></article><time>2026-09-10</time>",
+    "after": "<style>body{color:red}</style><nav>Books Home</nav><article><h2>Home delivery</h2><p>Call 555-0101.</p></article><time>2026-09-12</time><div id=\"cookie\">Accept cookies</div>",
+    "objective": "Accessible delivery contact details",
+    "expected_actionable": false
+  },
+  {
+    "name": "library_marketing",
+    "site": "library",
+    "before": "<article><h2>Home delivery</h2><p>Call 555-0101.</p><p>Enjoy our book fair.</p></article>",
+    "after": "<article><h2>Home delivery</h2><p>Call 555-0101.</p><p>Enjoy our new summer book fair.</p></article>",
+    "objective": "Accessible delivery contact details",
+    "expected_actionable": false
+  },
+  {
+    "name": "ambiguous_availability",
+    "site": "benefits",
+    "before": "<main><h1>Family Assistance</h1><p>Applications are open.</p></main>",
+    "after": "<main><h1>Family Assistance</h1><p>Applications may pause while funding is reviewed.</p></main>",
+    "objective": "Program availability",
+    "expected_actionable": true,
+    "expected_ambiguous": true
+  }
+]

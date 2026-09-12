@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,9 +16,12 @@ from fastapi.staticfiles import StaticFiles
 
 from agent.civic_canary.engine import RunExecutionError
 from agent.civic_canary.models import (
+    AddWebsiteRequest,
+    ConfirmMonitoringRequest,
     DemoVersionRequest,
     Finding,
     FindingStatus,
+    JourneyStep,
     PortalTarget,
     ReviewDecision,
     RunRequest,
@@ -36,7 +42,9 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
     if local_mode and not app.state.store.get_target("benefits-demo"):
         app.state.store.put_target(PortalTarget())
 
-    origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")]
+    origins = [
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -44,43 +52,158 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         allow_headers=["Content-Type", "X-Review-Token"],
     )
 
+    @app.middleware("http")
+    async def prevent_api_caching(request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     def require_token(x_review_token: str | None = Header(default=None)) -> None:
         if not app.state.verifier.verify(x_review_token):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid review token"
             )
 
+    def require_read(x_review_token: str | None = Header(default=None)) -> None:
+        if not local_mode:
+            require_token(x_review_token)
+
+    @app.post("/api/targets", dependencies=[Depends(require_token)])
+    def add_website(request: AddWebsiteRequest):
+        from agent.civic_canary.browser import validate_public_url
+        from services.monitoring import enqueue_scan
+
+        try:
+            validate_public_url(request.public_url)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        target = PortalTarget(
+            target_id=f"site-{uuid.uuid4().hex[:12]}",
+            name=request.name,
+            start_url=request.public_url,
+            allowed_hosts=[urlparse(request.public_url).hostname],
+            journey_steps=[JourneyStep(path="/", label="Submitted page")],
+            description=request.description,
+            monitoring_objective=request.monitoring_objective,
+            scan_frequency_minutes=request.scan_frequency_minutes,
+            guidance_context=request.guidance_context,
+            setup_status="PENDING",
+        )
+        if local_mode:
+            raise HTTPException(409, "Adding live websites requires AWS mode and AgentCore Browser")
+        app.state.store.put_target(target)
+        run = enqueue_scan(app.state.store, target)
+        target.setup_run_id = run.run_id
+        app.state.store.put_target(target)
+        return target
+
+    @app.get("/api/targets/{target_id}", dependencies=[Depends(require_read)])
+    def get_target(target_id: str):
+        target = app.state.store.get_target(target_id)
+        if not target:
+            raise HTTPException(404, "Website not found")
+        return target
+
+    @app.post("/api/targets/{target_id}/inspect", dependencies=[Depends(require_token)])
+    def inspect_website(target_id: str):
+        from services.monitoring import enqueue_scan
+
+        target = get_target(target_id)
+        if target.setup_status not in {"PENDING", "FAILED"}:
+            raise HTTPException(409, "Website inspection is already complete")
+        if target.setup_run_id:
+            existing = app.state.store.get_run(target.setup_run_id)
+            if existing and existing.status in {"QUEUED", "RUNNING"}:
+                return {"run": existing}
+        run = enqueue_scan(app.state.store, target)
+        target.setup_status = "PENDING"
+        target.setup_run_id = run.run_id
+        app.state.store.put_target(target)
+        return {"run": run}
+
+    @app.post("/api/targets/{target_id}/confirm", dependencies=[Depends(require_token)])
+    def confirm_website(target_id: str, request: ConfirmMonitoringRequest):
+        target = get_target(target_id)
+        if target.setup_status not in {"AWAITING_CONFIRMATION", "ACTIVE"}:
+            raise HTTPException(409, "Successful baseline inspection is required first")
+        if app.state.store.get_baseline(target_id) is None:
+            raise HTTPException(409, "Baseline evidence is missing")
+        target.monitored_sections = request.monitored_sections
+        target.setup_status = "ACTIVE"
+        target.next_scan_at = datetime.now(UTC) + timedelta(minutes=target.scan_frequency_minutes)
+        app.state.store.put_target(target)
+        return target
+
+    @app.get("/api/findings-page", dependencies=[Depends(require_read)])
+    def finding_page(limit: int = Query(50, ge=1, le=100), cursor: str | None = None):
+        try:
+            key = json.loads(base64.urlsafe_b64decode(cursor)) if cursor else None
+            if key is not None and (
+                set(key) != {"findingId"} or not isinstance(key["findingId"], str)
+            ):
+                raise ValueError("Invalid cursor")
+        except Exception as exc:
+            raise HTTPException(422, "Invalid cursor") from exc
+        rows, next_key = app.state.store.finding_page(limit, key)
+        next_cursor = (
+            base64.urlsafe_b64encode(json.dumps(next_key).encode()).decode() if next_key else None
+        )
+        return {"items": rows, "next_cursor": next_cursor}
+
+    @app.get("/api/findings/{finding_id}/artifact", dependencies=[Depends(require_token)])
+    def approved_artifact(finding_id: str):
+        finding = app.state.store.get_finding(finding_id)
+        if (
+            not finding
+            or finding.status != FindingStatus.APPROVED
+            or not finding.approved_artifact_key
+        ):
+            raise HTTPException(404, "Approved artifact is unavailable")
+        return Response(
+            app.state.store.read_artifact(finding.approved_artifact_key),
+            media_type="text/markdown",
+            headers={
+                "Content-Disposition": 'attachment; filename="approved-guidance.md"',
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "civic-canary"}
 
-    @app.get("/api/targets", response_model=list[PortalTarget])
+    @app.get(
+        "/api/targets", response_model=list[PortalTarget], dependencies=[Depends(require_read)]
+    )
     def list_targets() -> list[PortalTarget]:
-        return app.state.store.list_targets()
+        return app.state.store.target_page(100)[0]
 
-    @app.get("/api/runs")
+    @app.get("/api/runs", dependencies=[Depends(require_read)])
     def list_runs():
-        return app.state.store.list_runs()
+        return app.state.store.recent_runs(50)
 
-    @app.get("/api/runs/{run_id}")
+    @app.get("/api/runs/{run_id}", dependencies=[Depends(require_read)])
     def get_run(run_id: str):
         run = app.state.store.get_run(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="run not found")
         return run
 
-    @app.get("/api/findings", response_model=list[Finding])
+    @app.get("/api/findings", response_model=list[Finding], dependencies=[Depends(require_read)])
     def list_findings(
         finding_status: Annotated[FindingStatus | None, Query(alias="status")] = None,
     ):
-        findings = app.state.store.list_findings()
+        findings = app.state.store.finding_page(100)[0]
         return [
             finding
             for finding in findings
             if not finding_status or finding.status == finding_status
         ]
 
-    @app.get("/api/findings/{finding_id}", response_model=Finding)
+    @app.get(
+        "/api/findings/{finding_id}", response_model=Finding, dependencies=[Depends(require_read)]
+    )
     def get_finding(finding_id: str):
         finding = app.state.store.get_finding(finding_id)
         if not finding:
@@ -107,6 +230,12 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             run_id = f"run-{request.idempotency_key}"
             existing = app.state.store.get_run(run_id)
             if existing:
+                if existing.target_id != target.target_id:
+                    raise HTTPException(409, "Idempotency key belongs to another website")
+                if not local_mode and existing.status == "QUEUED":
+                    from services.monitoring import enqueue_scan
+
+                    existing = enqueue_scan(app.state.store, target, TriggerType.MANUAL, run_id)
                 return {"run": existing, "findings": []}
         else:
             run_id = f"run-{uuid.uuid4().hex[:12]}"
@@ -115,6 +244,16 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             run_id=run_id,
             target_id=target.target_id,
         )
+        if not local_mode:
+            from services.monitoring import enqueue_scan
+
+            if target.setup_status != "ACTIVE":
+                raise HTTPException(409, "Confirm monitoring sections before scanning")
+            response.status_code = status.HTTP_202_ACCEPTED
+            return {
+                "run": enqueue_scan(app.state.store, target, TriggerType.MANUAL, run_id),
+                "findings": [],
+            }
         service = ScanService(app.state.store)
         if service.agentcore_arn():
             try:
@@ -165,22 +304,23 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         if not finding:
             raise HTTPException(status_code=404, detail="finding not found")
         resuming_approval = (
-            finding.status == FindingStatus.APPROVAL_PENDING
-            and decision.action == "APPROVE"
+            finding.status == FindingStatus.APPROVAL_PENDING and decision.action == "APPROVE"
         )
         if finding.status != FindingStatus.OPEN and not resuming_approval:
             raise HTTPException(status_code=409, detail="finding already decided")
+        reviewer = "sha256:" + hashlib.sha256((x_review_token or "reviewer").encode()).hexdigest()
         decided_at = datetime.now(UTC)
         artifact_key = None
         if decision.action == "REJECT":
             rejected = finding.model_copy(
                 update={
                     "status": FindingStatus.REJECTED,
+                    "reviewed_by": reviewer,
                     "decision_note": decision.note,
                     "decided_at": decided_at,
                 }
             )
-            if not app.state.store.transition_finding(rejected, FindingStatus.OPEN):
+            if not app.state.store.commit_review(rejected, FindingStatus.OPEN):
                 raise HTTPException(status_code=409, detail="finding already decided")
             finding = rejected
         else:
@@ -190,6 +330,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                 pending = finding.model_copy(
                     update={
                         "status": FindingStatus.APPROVAL_PENDING,
+                        "reviewed_by": reviewer,
                         "decision_note": decision.note,
                         "decided_at": decided_at,
                     }
@@ -206,9 +347,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                         "decided_at": None,
                     }
                 )
-                app.state.store.transition_finding(
-                    rollback, FindingStatus.APPROVAL_PENDING
-                )
+                app.state.store.transition_finding(rollback, FindingStatus.APPROVAL_PENDING)
                 raise HTTPException(
                     status_code=502, detail="approved draft could not be stored"
                 ) from exc
@@ -216,11 +355,10 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                 update={
                     "status": FindingStatus.APPROVED,
                     "approved_artifact_key": artifact_key,
+                    "reviewed_by": reviewer,
                 }
             )
-            if app.state.store.transition_finding(
-                approved, FindingStatus.APPROVAL_PENDING
-            ):
+            if app.state.store.commit_review(approved, FindingStatus.APPROVAL_PENDING):
                 finding = approved
             else:
                 latest = app.state.store.get_finding(finding_id)
@@ -228,15 +366,6 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
                     raise HTTPException(status_code=409, detail="finding state changed")
                 finding = latest
                 artifact_key = latest.approved_artifact_key
-        app.state.store.record_review(
-            finding_id=finding.finding_id,
-            action=finding.status.value,
-            note=decision.note,
-            reviewer=(
-                "sha256:" + hashlib.sha256(x_review_token.encode()).hexdigest()
-                if x_review_token else "reviewer"
-            ),
-        )
         log_event(
             "review_decision_recorded",
             run_id=finding.run_id,

@@ -128,3 +128,15 @@ button svg, a svg { width: 17px; height: 17px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+.monitor-setup { background: white; border: 1px solid #d7e0dc; border-radius: 16px; padding: 24px; margin: 24px 0; display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+.monitor-setup select, .website-form input, .website-form textarea, .website-form select, .setup-status textarea { padding: 12px; border: 1px solid #9daea5; border-radius: 8px; color: #17352b; background: white; font: inherit; max-width: 100%; }
+.website-form { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.website-form label { display: grid; gap: 8px; }
+.website-form textarea { min-height: 100px; }
+.setup-status { width: 100%; }
+.setup-status textarea { width: 100%; min-height: 120px; display: block; margin-bottom: 16px; }
+.before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.before-after > div { background: #f0f5f2; padding: 16px; border-radius: 8px; overflow-wrap: anywhere; }
+.drawer p, .drawer pre { overflow-wrap: anywhere; white-space: pre-wrap; }
+@media (max-width: 650px) { .website-form, .before-after { grid-template-columns: 1fr; } }

@@ -1,0 +1,83 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ExistingTables",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:Scan"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/CivicCanarySites",
+        "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/CivicCanaryFindings",
+        "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/CivicCanaryReviews"
+      ]
+    },
+    {
+      "Sid": "EvidenceAndJobs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::civic-canary/*"
+    },
+    {
+      "Sid": "RemoveProcessedQueueEntries",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": [
+        "arn:aws:s3:::civic-canary/jobs/*",
+        "arn:aws:s3:::civic-canary/outbox/*"
+      ]
+    },
+    {
+      "Sid": "ListEvidenceAndQueues",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::civic-canary"
+    },
+    {
+      "Sid": "ConfiguredBrowser",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetBrowser",
+        "bedrock-agentcore:StartBrowserSession",
+        "bedrock-agentcore:GetBrowserSession",
+        "bedrock-agentcore:StopBrowserSession",
+        "bedrock-agentcore:ConnectBrowserAutomationStream"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:us-east-1:ACCOUNT_ID:browser/BROWSER_ID"
+    },
+    {
+      "Sid": "ConfiguredModel",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "MODEL_OR_INFERENCE_PROFILE_ARN",
+        "FOUNDATION_MODEL_ARN_IN_EACH_PROFILE_DESTINATION_REGION"
+      ]
+    },
+    {
+      "Sid": "DecisionEmail",
+      "Effect": "Allow",
+      "Action": "ses:SendEmail",
+      "Resource": "arn:aws:ses:us-east-1:ACCOUNT_ID:identity/VERIFIED_SENDER",
+      "Condition": {
+        "StringEquals": {
+          "ses:FromAddress": "VERIFIED_SENDER_EMAIL"
+        },
+        "ForAllValues:StringEquals": {
+          "ses:Recipients": [
+            "REVIEWER_EMAIL"
+          ]
+        }
+      }
+    }
+  ]
+}

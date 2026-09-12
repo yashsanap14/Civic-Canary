@@ -1,0 +1,12 @@
+{
+  "mode": "offline-contracts-with-mocked-model-and-AWS",
+  "tests": 21,
+  "failed": 0,
+  "contract_pass_rate": 1.0,
+  "detection_accuracy": null,
+  "relevance_accuracy": null,
+  "false_alert_rate": null,
+  "live_end_to_end_success_rate": null,
+  "human_review_seconds": null,
+  "note": "Contract checks do not measure model accuracy or live AWS reliability."
+}

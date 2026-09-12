@@ -23,3 +23,7 @@ agentcore/aws-targets.json
 agentcore/*/staging/
 sources/
 AGENTS.md
+
+.tools/
+
+.evaluation-junit.xml
