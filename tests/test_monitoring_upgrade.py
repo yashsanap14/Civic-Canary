@@ -331,6 +331,73 @@ def test_protected_add_confirm_and_artifact_audit(monkeypatch):
     assert model.proposed_patch in artifact.text
 
 
+def test_local_mode_keeps_demo_and_blocks_live_add(monkeypatch):
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "local")
+    monkeypatch.setenv("REVIEW_TOKEN", "test-review-token")
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("8.8.8.8", 443))])
+    store = InMemoryStore()
+    api = TestClient(create_app(store))
+    headers = {"X-Review-Token": "test-review-token"}
+    targets = api.get("/api/targets").json()
+    assert any(row["target_id"] == "benefits-demo" for row in targets)
+    blocked = api.post(
+        "/api/targets",
+        headers=headers,
+        json={
+            "name": "Library",
+            "public_url": "https://library.example.org/service",
+            "monitoring_objective": "Delivery contact information",
+        },
+    )
+    assert blocked.status_code == 409
+    assert "AgentCore" in blocked.json()["detail"]
+    switched = api.post(
+        "/api/demo/version",
+        headers=headers,
+        json={"target_id": "benefits-demo", "version": "v2"},
+    )
+    assert switched.status_code == 200
+    assert switched.json()["active_version"] == "v2"
+
+
+def test_live_website_confirm_schedules_next_scan(monkeypatch):
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "aws")
+    monkeypatch.setenv("REVIEW_TOKEN", "test-review-token")
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("8.8.8.8", 443))])
+    store = InMemoryStore()
+    api = TestClient(create_app(store))
+    headers = {"X-Review-Token": "test-review-token"}
+    added = api.post(
+        "/api/targets",
+        headers=headers,
+        json={
+            "name": "Library",
+            "public_url": "https://library.example.org/service",
+            "monitoring_objective": "Delivery contact information",
+            "scan_frequency_minutes": 60,
+        },
+    )
+    assert added.status_code == 200
+    target_id = added.json()["target_id"]
+    configured = store.get_target(target_id)
+    store.put_baseline(snapshot(CASES[0]["before"], site=target_id))
+    configured.setup_status = "AWAITING_CONFIRMATION"
+    configured.recommended_sections = ["Home delivery"]
+    store.put_target(configured)
+    confirmed = api.post(
+        f"/api/targets/{target_id}/confirm",
+        headers=headers,
+        json={"monitored_sections": ["Home delivery"]},
+    )
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert body["setup_status"] == "ACTIVE"
+    assert body["monitored_sections"] == ["Home delivery"]
+    assert body["next_scan_at"] is not None
+    listed = api.get("/api/targets", headers=headers).json()
+    assert any(row["target_id"] == target_id for row in listed)
+
+
 def test_atomic_aws_review_records_identity_and_evidence(monkeypatch):
     monkeypatch.setattr("services.storage.boto3.resource", MagicMock())
     client = MagicMock()
