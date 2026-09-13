@@ -155,13 +155,14 @@ async def run_due(store, now=None):
                 continue
             slot = int(now.timestamp()) // (target.scan_frequency_minutes * 60)
             digest = hashlib.sha256(f"{target.target_id}:{slot}".encode()).hexdigest()[:24]
+            # Idempotent scheduled run id. next_scan_at advances only after SUCCEEDED
+            # (or is reset to now on FAILED) so failures retry on the next worker tick.
             enqueue_scan(store, target, TriggerType.SCHEDULED, f"scheduled-{digest}")
-            target.next_scan_at = now + timedelta(minutes=target.scan_frequency_minutes)
-            store.put_target(target)
         if not cursor:
             break
     processed = 0
-    for key in store.list_json_keys("jobs/", 4):
+    job_budget = int(os.getenv("CIVIC_CANARY_JOB_BUDGET", "8"))
+    for key in store.list_json_keys("jobs/", max(1, job_budget)):
         job = store.get_json(key)
         if not job:
             continue
@@ -183,8 +184,11 @@ async def run_due(store, now=None):
             run.finished_at = now
             store.put_run(run)
             target = store.get_target(run.target_id)
-            if target and target.setup_status in {"PENDING", "FAILED"}:
-                target.setup_status = "FAILED"
+            if target:
+                if target.setup_status in {"PENDING", "FAILED"}:
+                    target.setup_status = "FAILED"
+                if target.setup_status == "ACTIVE":
+                    target.next_scan_at = now
                 store.put_target(target)
             log_event("worker_interrupted_run_failed", run_id=run_id)
             index_run(store, run)
@@ -192,8 +196,19 @@ async def run_due(store, now=None):
             processed += 1
             continue
         try:
-            await process_queued_run(store, run_id)
+            completed = await process_queued_run(store, run_id)
+            if completed.status == RunStatus.SUCCEEDED:
+                refreshed = store.get_target(completed.target_id)
+                if refreshed and refreshed.setup_status == "ACTIVE":
+                    refreshed.next_scan_at = now + timedelta(
+                        minutes=refreshed.scan_frequency_minutes
+                    )
+                    store.put_target(refreshed)
         except Exception as exc:
+            failed_target = store.get_target(run.target_id)
+            if failed_target and failed_target.setup_status == "ACTIVE":
+                failed_target.next_scan_at = now
+                store.put_target(failed_target)
             log_event(
                 "worker_job_error",
                 run_id=run_id,
@@ -203,6 +218,20 @@ async def run_due(store, now=None):
         processed += 1
     from services.notifications import deliver_pending
 
-    result = {"processed": processed, "notifications": deliver_pending(store)}
+    try:
+        notifications = deliver_pending(store)
+    except Exception as exc:
+        notifications = {
+            "status": "DELIVERY_ERROR",
+            "sent": 0,
+            "error_category": type(exc).__name__,
+        }
+        log_event(
+            "notification_tick_failed",
+            run_id="worker",
+            error_category=type(exc).__name__,
+            summary=str(exc),
+        )
+    result = {"processed": processed, "notifications": notifications}
     log_event("worker_tick_completed", run_id="worker", **result)
     return result

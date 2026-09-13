@@ -76,13 +76,26 @@ const baseUrl = window.CIVIC_CANARY_CONFIG?.apiUrl ?? import.meta.env.VITE_API_U
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, init)
-  const payload = await response.json().catch(() => ({}))
+  const raw = await response.text()
+  let payload: Record<string, unknown> = {}
+  if (raw) {
+    try {
+      payload = JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`)
+      }
+      throw new Error('API returned a non-JSON response')
+    }
+  }
   if (!response.ok) {
     const detail = payload.detail
     throw new Error(
       typeof detail === 'string'
         ? detail
-        : detail?.message ?? `Request failed with status ${response.status}`,
+        : detail && typeof detail === 'object' && 'message' in detail && typeof (detail as { message: unknown }).message === 'string'
+          ? (detail as { message: string }).message
+          : `Request failed with status ${response.status}`,
     )
   }
   return payload as T
@@ -96,6 +109,8 @@ function protectedHeaders(token: string) {
 }
 
 export const api = {
+  target: (id: string, token = '') =>
+    request<Target>(`/api/targets/${id}`, { headers: protectedHeaders(token) }),
   targets: (token = '') => request<Target[]>('/api/targets', { headers: protectedHeaders(token) }),
   runs: (token = '') => request<Run[]>('/api/runs', { headers: protectedHeaders(token) }),
   run: (runId: string, token = '') => request<Run>(`/api/runs/${runId}`, { headers: protectedHeaders(token) }),
@@ -111,7 +126,7 @@ export const api = {
     request<{ run: Run; findings: Finding[] }>('/api/runs', {
       method: 'POST',
       headers: protectedHeaders(token),
-      body: JSON.stringify({ target_id: targetId }),
+      body: JSON.stringify({ target_id: targetId, idempotency_key: crypto.randomUUID() }),
     }),
   addWebsite: (data: Record<string, unknown>, token: string) => request<Target>('/api/targets', {
     method: 'POST', headers: protectedHeaders(token), body: JSON.stringify(data),

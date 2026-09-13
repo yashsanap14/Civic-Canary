@@ -33,8 +33,14 @@ def deliver_pending(store, client=None) -> dict:
     public_url = os.getenv("CIVIC_CANARY_PUBLIC_URL", "")
     if not sender or not recipient:
         return {"status": "NOT_CONFIGURED", "sent": 0}
-    if urlparse(public_url).scheme != "https" or not urlparse(public_url).hostname:
-        raise ValueError("CIVIC_CANARY_PUBLIC_URL must be an HTTPS URL")
+    parsed = urlparse(public_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        log_event(
+            "notification_misconfigured",
+            run_id="notifications",
+            summary="CIVIC_CANARY_PUBLIC_URL must be an HTTPS URL; skipping delivery this tick",
+        )
+        return {"status": "NOT_CONFIGURED", "sent": 0, "reason": "invalid_public_url"}
     ses = client or boto3.client("sesv2", region_name=os.getenv("AWS_REGION", "us-east-1"))
     sent = 0
     for key in store.list_json_keys("outbox/", 50):

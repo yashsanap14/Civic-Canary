@@ -271,6 +271,18 @@ export default function App() {
     }
   }
 
+  const waitForSetup = async (targetId: string) => {
+    let latest = await api.target(targetId, token)
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      if (latest.setup_status === 'AWAITING_CONFIRMATION' || latest.setup_status === 'FAILED' || latest.setup_status === 'ACTIVE') {
+        return latest
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 2000))
+      latest = await api.target(targetId, token)
+    }
+    throw new Error('Inspection is still running. Check setup status shortly.')
+  }
+
   const addWebsite = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const data = new FormData(event.currentTarget)
@@ -284,14 +296,21 @@ export default function App() {
         scan_frequency_minutes: Number(data.get('frequency')), guidance_context: data.get('guidance'),
       }, token)
       setShowAdd(false)
-      const rows = await load()
-      setTarget(rows.find((row) => row.target_id === added.target_id) ?? added)
       setLiveFocusId(added.target_id)
-      const status = added.setup_status
+      setMessage('Live website saved. Waiting for baseline inspection…')
+      let ready = added
+      if (added.setup_status === 'PENDING') {
+        ready = await waitForSetup(added.target_id)
+      }
+      const rows = await load()
+      setTarget(rows.find((row) => row.target_id === ready.target_id) ?? ready)
+      if (ready.setup_status === 'FAILED') {
+        throw new Error('Inspection failed. Use Retry inspection after checking worker logs.')
+      }
       setMessage(
-        status === 'AWAITING_CONFIRMATION'
-          ? 'Live website added and baseline captured. Confirm the sections to monitor.'
-          : 'Live website added. Inspection is queued—refresh to check progress, then confirm what to monitor.',
+        ready.setup_status === 'AWAITING_CONFIRMATION'
+          ? 'Baseline captured. Confirm the sections to monitor.'
+          : 'Live website is ready.',
       )
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Website could not be added')

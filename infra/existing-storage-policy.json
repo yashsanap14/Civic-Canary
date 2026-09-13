@@ -4,7 +4,12 @@
     {
       "Sid": "ExistingCivicCanaryTables",
       "Effect": "Allow",
-      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:Scan"],
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:Scan",
+        "dynamodb:TransactWriteItems"
+      ],
       "Resource": [
         "arn:aws:dynamodb:us-east-1:YOUR_ACCOUNT_ID:table/CivicCanarySites",
         "arn:aws:dynamodb:us-east-1:YOUR_ACCOUNT_ID:table/CivicCanaryFindings",
@@ -12,11 +17,10 @@
       ]
     },
     {
-      "Sid": "ListRunHistory",
+      "Sid": "ListEvidenceQueuesAndIndexes",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
-      "Resource": "arn:aws:s3:::civic-canary",
-      "Condition": {"StringLike": {"s3:prefix": ["runs/*"]}}
+      "Resource": "arn:aws:s3:::civic-canary"
     },
     {
       "Sid": "ExistingCivicCanaryObjects",
@@ -28,7 +32,21 @@
         "arn:aws:s3:::civic-canary/snapshots/*",
         "arn:aws:s3:::civic-canary/screenshots/*",
         "arn:aws:s3:::civic-canary/playbooks/*",
-        "arn:aws:s3:::civic-canary/approved/*"
+        "arn:aws:s3:::civic-canary/approved/*",
+        "arn:aws:s3:::civic-canary/jobs/*",
+        "arn:aws:s3:::civic-canary/recent-runs/*",
+        "arn:aws:s3:::civic-canary/outbox/*",
+        "arn:aws:s3:::civic-canary/notification-events/*",
+        "arn:aws:s3:::civic-canary/notification-claims/*"
+      ]
+    },
+    {
+      "Sid": "RemoveProcessedQueueEntries",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": [
+        "arn:aws:s3:::civic-canary/jobs/*",
+        "arn:aws:s3:::civic-canary/outbox/*"
       ]
     }
   ]

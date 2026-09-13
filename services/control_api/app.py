@@ -140,8 +140,14 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             raise HTTPException(409, "Website inspection is already complete")
         if target.setup_run_id:
             existing = app.state.store.get_run(target.setup_run_id)
-            if existing and existing.status in {"QUEUED", "RUNNING"}:
+            if existing and existing.status == "RUNNING":
                 return {"run": existing}
+            if existing and existing.status == "QUEUED":
+                # Repair a missing jobs/*.json object so the worker can pick it up.
+                run = enqueue_scan(
+                    app.state.store, target, TriggerType.MANUAL, existing.run_id
+                )
+                return {"run": run}
         target.setup_status = "PENDING"
         app.state.store.put_target(target)
         if local_mode:
@@ -215,8 +221,20 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         )
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "service": "civic-canary"}
+    def health() -> dict[str, str | bool]:
+        payload: dict[str, str | bool] = {
+            "status": "ok",
+            "service": "civic-canary",
+            "mode": "local" if local_mode else "aws",
+        }
+        if not local_mode:
+            try:
+                app.state.store.target_page(1)
+                payload["storage"] = "ok"
+            except Exception as exc:
+                payload["status"] = "degraded"
+                payload["storage"] = type(exc).__name__
+        return payload
 
     @app.get(
         "/api/targets", response_model=list[PortalTarget], dependencies=[Depends(require_read)]

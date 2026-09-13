@@ -7,7 +7,8 @@
       "Action": [
         "dynamodb:GetItem",
         "dynamodb:PutItem",
-        "dynamodb:Scan"
+        "dynamodb:Scan",
+        "dynamodb:TransactWriteItems"
       ],
       "Resource": [
         "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/CivicCanarySites",

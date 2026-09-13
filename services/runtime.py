@@ -49,10 +49,20 @@ class ScanService:
         if production:
             run.reasoning_source = "strands-bedrock"
         self.store.put_run(run)
+        log_event(
+            "scan_started",
+            run_id=resolved_run_id,
+            target_id=target.target_id,
+            trigger_type=trigger.value if hasattr(trigger, "value") else str(trigger),
+            setup_status=target.setup_status,
+            production=production,
+            has_baseline=self.store.get_baseline(target.target_id) is not None,
+        )
         try:
             baseline = self.store.get_baseline(target.target_id)
             if production:
-                if target.setup_status in {"PENDING", "FAILED"}:
+                needs_setup = target.setup_status in {"PENDING", "FAILED"}
+                if needs_setup:
                     baseline = None
                 from agent.civic_canary.browser import AgentCoreBrowserAdapter
                 from agent.civic_canary.reasoning import StrandsReasoner
@@ -67,10 +77,17 @@ class ScanService:
                     for attempt in range(2):
                         try:
                             return asyncio.run(self.browser.capture(target, resolved_run_id))
-                        except Exception:
+                        except Exception as first_error:
                             if attempt:
                                 raise
                             run.retry_count += 1
+                            log_event(
+                                "browser_capture_retry",
+                                run_id=resolved_run_id,
+                                target_id=target.target_id,
+                                error_category=type(first_error).__name__,
+                                summary=str(first_error),
+                            )
 
                 snapshot, findings, trace, timings = await asyncio.to_thread(
                     StrandsReasoner().execute, target, baseline, resolved_run_id, guidance, capture
@@ -82,10 +99,35 @@ class ScanService:
                 self.store.put_run(run)
                 if baseline is None:
                     self.store.put_baseline(snapshot)
-                    target.recommended_sections = trace["packet"]["recommended_sections"]
-                    target.setup_status = "AWAITING_CONFIRMATION"
-                    target.setup_run_id = resolved_run_id
-                    self.store.put_target(target)
+                    log_event(
+                        "baseline_saved",
+                        run_id=resolved_run_id,
+                        target_id=target.target_id,
+                        setup=needs_setup,
+                        pages=len(snapshot.pages),
+                    )
+                    # Only live/setup onboarding enters AWAITING_CONFIRMATION. ACTIVE demos
+                    # keep ACTIVE after their first baseline so V1→V2 runs stay unblocked.
+                    if needs_setup:
+                        latest = self.store.get_target(target.target_id) or target
+                        latest.recommended_sections = trace["packet"]["recommended_sections"]
+                        latest.setup_status = "AWAITING_CONFIRMATION"
+                        latest.setup_run_id = resolved_run_id
+                        self.store.put_target(latest)
+                        target = latest
+                        run.status = RunStatus.SUCCEEDED
+                        run.summary = "Baseline captured. Confirm the sections to monitor."
+                        run.finished_at = datetime.now(UTC)
+                        run.notification_status = "NOT_REQUIRED"
+                        self.store.put_snapshot(snapshot)
+                        self.store.put_run(run)
+                        log_event(
+                            "setup_awaiting_confirmation",
+                            run_id=resolved_run_id,
+                            target_id=target.target_id,
+                            sections=len(target.recommended_sections),
+                        )
+                        return run, []
             else:
                 from agent.civic_canary.browser import HttpBrowserAdapter
 
@@ -167,18 +209,22 @@ class ScanService:
                 for finding in findings:
                     queue_notifications(self.store, finding)
                 run.notification_status = "PENDING" if persisted else "NOT_REQUIRED"
-                target.last_scan_at = run.finished_at
-                target.next_scan_at = run.finished_at + timedelta(
-                    minutes=target.scan_frequency_minutes
+                latest = self.store.get_target(target.target_id) or target
+                latest.last_scan_at = run.finished_at
+                latest.next_scan_at = run.finished_at + timedelta(
+                    minutes=latest.scan_frequency_minutes
                 )
-                self.store.put_target(target)
+                self.store.put_target(latest)
+                target = latest
             self.store.put_run(run)
             log_event(
                 "scan_completed",
                 run_id=run.run_id,
+                target_id=target.target_id,
                 engine=run.reasoning_source,
                 new_findings=len(persisted),
                 status=run.status,
+                setup_status=target.setup_status,
             )
             return run, persisted
         except Exception as exc:
@@ -193,7 +239,18 @@ class ScanService:
             )
             run.summary = str(exc)
             self.store.put_run(run)
-            log_event("scan_failed", run_id=run.run_id, error_category=run.error_category)
+            # Allow a failed ACTIVE site to be retried on the next worker tick.
+            latest = self.store.get_target(target.target_id)
+            if latest and latest.setup_status == "ACTIVE":
+                latest.next_scan_at = datetime.now(UTC)
+                self.store.put_target(latest)
+            log_event(
+                "scan_failed",
+                run_id=run.run_id,
+                target_id=target.target_id,
+                error_category=run.error_category,
+                setup_status=getattr(latest or target, "setup_status", None),
+            )
             if isinstance(exc, RunExecutionError):
                 raise
             raise RunExecutionError(run, exc) from exc

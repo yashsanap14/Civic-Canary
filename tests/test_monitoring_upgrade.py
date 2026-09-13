@@ -689,3 +689,100 @@ async def test_production_setup_run_reaches_awaiting_confirmation(monkeypatch):
     assert refreshed.setup_status == "AWAITING_CONFIRMATION"
     assert refreshed.recommended_sections
     assert store.get_baseline(configured.target_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_active_demo_first_baseline_stays_active(monkeypatch):
+    """Seeded ACTIVE demos must not be demoted to AWAITING_CONFIRMATION."""
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "aws")
+    store = InMemoryStore()
+    configured = target().model_copy(update={"setup_status": "ACTIVE", "kind": "demo"})
+    store.put_target(configured)
+    captured = snapshot(CASES[0]["before"], site=configured.target_id)
+
+    def execute(self, configured_target, baseline, run_id, guidance, capture):
+        assert baseline is None
+        snap = capture()
+        return (
+            snap,
+            [],
+            {
+                "run_id": run_id,
+                "engine": "strands-bedrock",
+                "model_id": "offline-test-model",
+                "packet": {
+                    "summary": "Baseline established",
+                    "recommendations": [],
+                    "recommended_sections": snap.pages[0].headings[:1],
+                },
+            },
+            [],
+        )
+
+    monkeypatch.setattr(StrandsReasoner, "execute", execute)
+    run, findings = await ScanService(store, FakeBrowser(captured)).run_local(
+        configured, "MANUAL", "demo-baseline"
+    )
+    assert run.status == "SUCCEEDED"
+    assert findings == []
+    refreshed = store.get_target(configured.target_id)
+    assert refreshed.setup_status == "ACTIVE"
+    assert store.get_baseline(configured.target_id) is not None
+
+
+def test_invalid_public_url_does_not_crash_notification_tick(monkeypatch):
+    monkeypatch.setenv("CIVIC_CANARY_EMAIL_FROM", "sender@example.org")
+    monkeypatch.setenv("CIVIC_CANARY_EMAIL_TO", "reviewer@example.org")
+    monkeypatch.setenv("CIVIC_CANARY_PUBLIC_URL", "not-a-url")
+    store = InMemoryStore()
+    store.put_finding(finding())
+    queue_notifications(store, finding())
+    result = deliver_pending(store, MagicMock())
+    assert result["status"] == "NOT_CONFIGURED"
+    assert result["sent"] == 0
+    assert store.list_json_keys("outbox/")
+
+
+def test_store_factory_fails_fast_when_aws_config_missing(monkeypatch):
+    from services.store_factory import default_store
+
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "aws")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    for key in (
+        "CIVIC_CANARY_SITES_TABLE",
+        "CIVIC_CANARY_FINDINGS_TABLE",
+        "CIVIC_CANARY_REVIEWS_TABLE",
+        "CIVIC_CANARY_S3_BUCKET",
+        "AWS_STORAGE_LAYOUT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "services.store_factory.boto3.client",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ssm unavailable")),
+    )
+    with pytest.raises(RuntimeError, match="AWS storage config is incomplete"):
+        default_store()
+
+
+@pytest.mark.asyncio
+async def test_failed_active_scan_resets_next_scan_for_retry(monkeypatch):
+    monkeypatch.setenv("CIVIC_CANARY_MODE", "aws")
+    store = InMemoryStore()
+    future = datetime.now(UTC) + timedelta(days=1)
+    configured = target().model_copy(
+        update={"setup_status": "ACTIVE", "next_scan_at": future, "kind": "live"}
+    )
+    store.put_target(configured)
+    store.put_baseline(snapshot(CASES[0]["before"]))
+
+    def execute(self, configured_target, baseline, run_id, guidance, capture):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(StrandsReasoner, "execute", execute)
+    with pytest.raises(RunExecutionError):
+        await ScanService(store, FakeBrowser(snapshot(CASES[0]["after"]))).run_local(
+            configured, "MANUAL", "retry-soon"
+        )
+    refreshed = store.get_target(configured.target_id)
+    assert refreshed.next_scan_at is not None
+    assert refreshed.next_scan_at <= datetime.now(UTC) + timedelta(seconds=5)
