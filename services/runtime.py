@@ -16,6 +16,43 @@ from services.brief import build_monitoring_brief
 from services.observability import log_event
 from services.storage import Store
 
+
+def _expand_onboarding_redirect_hosts(
+    store: Store,
+    target: PortalTarget,
+    *,
+    run_id: str,
+) -> PortalTarget:
+    """Probe HTTPS redirects for setup scans and persist any safe final hosts."""
+    from agent.civic_canary.browser import discover_https_redirect_hosts
+
+    if target.setup_status not in {"PENDING", "FAILED"}:
+        return target
+    if (target.start_url or "").startswith("fixture:"):
+        return target
+    expanded, chain = discover_https_redirect_hosts(
+        target.start_url,
+        target.allowed_hosts,
+        run_id=run_id,
+        target_id=target.target_id,
+    )
+    if expanded == list(target.allowed_hosts):
+        return target
+    updated = target.model_copy(update={"allowed_hosts": expanded})
+    store.put_target(updated)
+    log_event(
+        "target_allowed_hosts_updated",
+        run_id=run_id,
+        target_id=target.target_id,
+        original_host=(target.allowed_hosts[0] if target.allowed_hosts else None),
+        redirect_chain=chain,
+        final_host=expanded[-1] if expanded else None,
+        accepted=True,
+        allowed_hosts=expanded,
+    )
+    return updated
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = PROJECT_ROOT / "web" / "public" / "portal"
 
@@ -61,6 +98,9 @@ class ScanService:
         )
         try:
             baseline = self.store.get_baseline(target.target_id)
+            target = _expand_onboarding_redirect_hosts(
+                self.store, target, run_id=resolved_run_id
+            )
             if production:
                 needs_setup = target.setup_status in {"PENDING", "FAILED"}
                 if needs_setup:
@@ -93,6 +133,17 @@ class ScanService:
                 snapshot, findings, trace, timings = await asyncio.to_thread(
                     StrandsReasoner().execute, target, baseline, resolved_run_id, guidance, capture
                 )
+                stored = self.store.get_target(target.target_id)
+                if stored is not None and list(stored.allowed_hosts) != list(target.allowed_hosts):
+                    self.store.put_target(target)
+                    log_event(
+                        "target_allowed_hosts_updated",
+                        run_id=resolved_run_id,
+                        target_id=target.target_id,
+                        allowed_hosts=target.allowed_hosts,
+                        accepted=True,
+                        summary="Persisted browser-discovered redirect hosts after capture",
+                    )
                 run.review_memo = trace
                 run.reasoning_source = "strands-bedrock"
                 run.node_timings = timings
@@ -111,6 +162,9 @@ class ScanService:
                     # keep ACTIVE after their first baseline so V1→V2 runs stay unblocked.
                     if needs_setup:
                         latest = self.store.get_target(target.target_id) or target
+                        latest.allowed_hosts = list(
+                            dict.fromkeys([*latest.allowed_hosts, *target.allowed_hosts])
+                        )
                         latest.recommended_sections = trace["packet"]["recommended_sections"]
                         latest.setup_status = "AWAITING_CONFIRMATION"
                         latest.setup_run_id = resolved_run_id

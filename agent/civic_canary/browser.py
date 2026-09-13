@@ -117,6 +117,207 @@ def validate_navigation_url(
         raise UnsafeTargetError("login, CAPTCHA, and upload paths are not supported")
 
 
+def _normalize_host(hostname: str | None) -> str | None:
+    if not hostname:
+        return None
+    return hostname.lower().rstrip(".")
+
+
+def _unique_hosts(*hosts: str | None) -> list[str]:
+    seen: list[str] = []
+    for host in hosts:
+        normalized = _normalize_host(host)
+        if normalized and normalized not in seen:
+            seen.append(normalized)
+    return seen
+
+
+def discover_https_redirect_hosts(
+    start_url: str,
+    allowed_hosts: list[str],
+    *,
+    run_id: str,
+    target_id: str,
+    max_hops: int = 6,
+) -> tuple[list[str], list[str]]:
+    """Follow the submitted HTTPS URL's redirect chain and return expanded allow-list hosts.
+
+    Only hosts reached through a normal redirect chain that also pass
+    ``validate_public_url`` (public HTTPS, no private DNS) are accepted.
+    Network/DNS failures soft-fail and leave the allow-list unchanged so browser
+    onboarding can still accept a safe final host after navigation.
+    """
+    from services.observability import log_event
+
+    original_host = _normalize_host(urlparse(start_url).hostname)
+    current = start_url
+    chain: list[str] = [current]
+    accepted = _unique_hosts(*allowed_hosts, original_host)
+    try:
+        validate_public_url(start_url)
+    except UnsafeTargetError as exc:
+        log_event(
+            "browser_redirect_probe_skipped",
+            run_id=run_id,
+            target_id=target_id,
+            original_host=original_host,
+            start_url=start_url,
+            summary=str(exc),
+            accepted=False,
+            allowed_hosts=accepted,
+        )
+        return accepted, chain
+
+    try:
+        with httpx.Client(
+            timeout=15.0,
+            follow_redirects=False,
+            headers={"User-Agent": "CivicCanary/0.1 read-only"},
+        ) as client:
+            for _ in range(max_hops):
+                response = client.get(current)
+                if not response.is_redirect:
+                    break
+                location = response.headers.get("location")
+                if not location:
+                    break
+                next_url = urljoin(current, location)
+                try:
+                    validate_public_url(next_url)
+                except UnsafeTargetError as exc:
+                    log_event(
+                        "browser_redirect_hop_rejected",
+                        run_id=run_id,
+                        target_id=target_id,
+                        original_host=original_host,
+                        redirect_chain=chain,
+                        rejected_url=next_url,
+                        summary=str(exc),
+                        accepted=False,
+                        allowed_hosts=accepted,
+                    )
+                    raise UnsafeTargetError(
+                        f"Redirect target is not a safe public HTTPS host: {next_url}"
+                    ) from exc
+                next_host = _normalize_host(urlparse(next_url).hostname)
+                if next_host and next_host not in accepted:
+                    accepted.append(next_host)
+                chain.append(next_url)
+                current = next_url
+            else:
+                raise UnsafeTargetError("Too many redirects while probing the submitted URL")
+    except UnsafeTargetError:
+        raise
+    except (httpx.HTTPError, OSError) as exc:
+        log_event(
+            "browser_redirect_probe_unavailable",
+            run_id=run_id,
+            target_id=target_id,
+            original_host=original_host,
+            redirect_chain=chain,
+            final_host=original_host,
+            accepted=False,
+            allowed_hosts=accepted,
+            error_category=type(exc).__name__,
+            summary=str(exc),
+        )
+        return accepted, chain
+
+    final_host = _normalize_host(urlparse(current).hostname)
+    log_event(
+        "browser_redirect_probe_completed",
+        run_id=run_id,
+        target_id=target_id,
+        original_host=original_host,
+        redirect_chain=chain,
+        final_host=final_host,
+        accepted=True,
+        allowed_hosts=accepted,
+        summary="Safe HTTPS redirect hosts merged into allow-list",
+    )
+    return accepted, chain
+
+
+def incorporate_final_navigation_host(
+    *,
+    submitted_url: str,
+    final_url: str,
+    allowed_hosts: list[str],
+    onboarding: bool,
+    run_id: str,
+    target_id: str,
+    redirect_chain: list[str] | None = None,
+) -> list[str]:
+    """During onboarding, accept a browser-followed redirect host that passes public checks."""
+    from services.observability import log_event
+
+    original_host = _normalize_host(urlparse(submitted_url).hostname)
+    final_host = _normalize_host(urlparse(final_url).hostname)
+    accepted = _unique_hosts(*allowed_hosts, original_host)
+    chain = list(redirect_chain or [submitted_url])
+    if final_url not in chain:
+        chain.append(final_url)
+
+    if final_host and final_host in {host.lower() for host in accepted}:
+        log_event(
+            "browser_redirect_final_already_allowed",
+            run_id=run_id,
+            target_id=target_id,
+            original_host=original_host,
+            redirect_chain=chain,
+            final_host=final_host,
+            accepted=True,
+            allowed_hosts=accepted,
+        )
+        return accepted
+
+    if not onboarding:
+        log_event(
+            "browser_redirect_final_rejected",
+            run_id=run_id,
+            target_id=target_id,
+            original_host=original_host,
+            redirect_chain=chain,
+            final_host=final_host,
+            accepted=False,
+            allowed_hosts=accepted,
+            summary="Final host not on allow-list and onboarding expansion is disabled",
+        )
+        validate_navigation_url(final_url, accepted)
+        return accepted
+
+    try:
+        validate_public_url(final_url)
+    except UnsafeTargetError as exc:
+        log_event(
+            "browser_redirect_final_rejected",
+            run_id=run_id,
+            target_id=target_id,
+            original_host=original_host,
+            redirect_chain=chain,
+            final_host=final_host,
+            accepted=False,
+            allowed_hosts=accepted,
+            summary=str(exc),
+        )
+        raise
+
+    if final_host:
+        accepted.append(final_host)
+    log_event(
+        "browser_redirect_final_accepted",
+        run_id=run_id,
+        target_id=target_id,
+        original_host=original_host,
+        redirect_chain=chain,
+        final_host=final_host,
+        accepted=True,
+        allowed_hosts=accepted,
+        summary="Onboarding browser redirect host added to allow-list",
+    )
+    return accepted
+
+
 def request_is_allowed(method: str, url: str, allowed_hosts: list[str]) -> bool:
     """Return whether a browser subrequest is safe to send from a capture session."""
     parsed = urlparse(url)
@@ -352,6 +553,7 @@ class HttpBrowserAdapter(BrowserAdapter):
 
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target)
+        onboarding = target.setup_status in {"PENDING", "FAILED"}
         pages: list[PageSnapshot] = []
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds, follow_redirects=False
@@ -359,6 +561,8 @@ class HttpBrowserAdapter(BrowserAdapter):
             for step in target.journey_steps:
                 page_url = page_url_for(target, step.path)
                 validate_navigation_url(page_url, target.allowed_hosts)
+                submitted_url = page_url
+                redirect_chain = [page_url]
                 response = None
                 for _ in range(6):
                     response = await client.get(
@@ -366,13 +570,42 @@ class HttpBrowserAdapter(BrowserAdapter):
                     )
                     if not response.is_redirect:
                         break
-                    page_url = urljoin(page_url, response.headers.get("location", ""))
-                    validate_navigation_url(page_url, target.allowed_hosts)
+                    next_url = urljoin(page_url, response.headers.get("location", ""))
+                    try:
+                        validate_navigation_url(next_url, target.allowed_hosts)
+                    except UnsafeTargetError:
+                        if not onboarding:
+                            raise
+                        target.allowed_hosts = incorporate_final_navigation_host(
+                            submitted_url=submitted_url,
+                            final_url=next_url,
+                            allowed_hosts=target.allowed_hosts,
+                            onboarding=True,
+                            run_id=run_id,
+                            target_id=target.target_id,
+                            redirect_chain=redirect_chain,
+                        )
+                    page_url = next_url
+                    redirect_chain.append(page_url)
                 else:
                     raise RuntimeError("too many redirects while capturing target")
                 if response is None:
                     raise RuntimeError("target returned no response")
                 response.raise_for_status()
+                try:
+                    validate_navigation_url(page_url, target.allowed_hosts)
+                except UnsafeTargetError:
+                    if not onboarding:
+                        raise
+                    target.allowed_hosts = incorporate_final_navigation_host(
+                        submitted_url=submitted_url,
+                        final_url=page_url,
+                        allowed_hosts=target.allowed_hosts,
+                        onboarding=True,
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        redirect_chain=redirect_chain,
+                    )
 
                 async def check_link(href: str, base_page_url: str = page_url) -> int:
                     if not href or href.startswith(("#", "mailto:", "tel:")):
@@ -651,7 +884,21 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                             context_count=len(browser.contexts),
                             page_count_after=len(context.pages),
                         )
-                        validate_navigation_url(final_url, target.allowed_hosts)
+                        onboarding = target.setup_status in {"PENDING", "FAILED"}
+                        try:
+                            validate_navigation_url(final_url, target.allowed_hosts)
+                        except UnsafeTargetError:
+                            if not onboarding:
+                                raise
+                            target.allowed_hosts = incorporate_final_navigation_host(
+                                submitted_url=page_url,
+                                final_url=final_url,
+                                allowed_hosts=target.allowed_hosts,
+                                onboarding=True,
+                                run_id=run_id,
+                                target_id=target.target_id,
+                                redirect_chain=[page_url, final_url],
+                            )
                         if response is not None and response.status >= 400:
                             raise RuntimeError(
                                 f"page returned HTTP {response.status}: {page_url}"
