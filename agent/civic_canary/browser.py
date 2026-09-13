@@ -370,27 +370,52 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
         from bedrock_agentcore.tools.browser_client import browser_session
         from playwright.sync_api import sync_playwright
 
+        from services.observability import log_event
+
         pages: list[PageSnapshot] = []
         screenshot_key: str | None = None
         axe_path = Path(__file__).resolve().parents[1] / "fixtures" / "axe.min.js"
-        if not axe_path.is_file():
-            raise RuntimeError("bundled axe-core script is missing from the runtime")
-        axe_source = axe_path.read_text(encoding="utf-8")
+        axe_source = axe_path.read_text(encoding="utf-8") if axe_path.is_file() else None
+        if axe_source is None:
+            log_event(
+                "browser_axe_missing",
+                run_id=run_id,
+                target_id=target.target_id,
+                summary="axe.min.js missing; continuing with heuristic accessibility checks only",
+            )
+
+        session_id: str | None = None
+        browser = None
+        page = None
         with (
             browser_session(self.region, identifier=self.identifier) as client,
             sync_playwright() as playwright,
         ):
-            from services.observability import log_event
-
+            session_id = getattr(client, "session_id", None)
             log_event(
-                "browser_session_started",
+                "browser_session_created",
                 run_id=run_id,
                 target_id=target.target_id,
-                browser_session_id=client.session_id,
+                browser_session_id=session_id,
+                browser_id=self.identifier,
             )
             ws_url, headers = client.generate_ws_headers()
             browser = playwright.chromium.connect_over_cdp(ws_url, headers=headers)
-            context = browser.new_context(service_workers="block")
+            # AgentCore Session Replay / Web Bot Auth only attach to the default CDP context.
+            # Creating browser.new_context() yields an empty replay (Pages 0) with no recording.
+            if not browser.contexts:
+                raise RuntimeError(
+                    "AgentCore Browser connected without a default context; cannot record navigation"
+                )
+            context = browser.contexts[0]
+            log_event(
+                "browser_connected",
+                run_id=run_id,
+                target_id=target.target_id,
+                browser_session_id=session_id,
+                contexts=len(browser.contexts),
+                open_pages=len(context.pages),
+            )
 
             def guard_route(route) -> None:
                 request = route.request
@@ -410,23 +435,92 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                 route.continue_()
 
             context.set_default_timeout(20000)
-            context.set_default_navigation_timeout(30000)
+            context.set_default_navigation_timeout(45000)
             context.route("**/*", guard_route)
             page = context.pages[0] if context.pages else context.new_page()
-            context.on("page", lambda popup: popup.close())
+            kept_pages = {id(page)}
+
+            def close_unexpected_popup(popup) -> None:
+                if id(popup) in kept_pages:
+                    return
+                try:
+                    popup.close()
+                except Exception:
+                    return
+
+            context.on("page", close_unexpected_popup)
+            log_event(
+                "browser_page_ready",
+                run_id=run_id,
+                target_id=target.target_id,
+                browser_session_id=session_id,
+                page_count=len(context.pages),
+            )
             try:
                 for index, step in enumerate(target.journey_steps):
                     page_url = page_url_for(target, step.path)
                     validate_navigation_url(page_url, target.allowed_hosts)
-                    response = page.goto(page_url, wait_until="networkidle")
-                    validate_navigation_url(page.url, target.allowed_hosts)
-                    if response and response.status >= 400:
-                        raise RuntimeError(f"page returned HTTP {response.status}: {page_url}")
-                    page.add_script_tag(content=axe_source)
-                    axe_result = page.evaluate(
-                        "async () => await window.axe.run(document, {resultTypes: ['violations']})"
+                    log_event(
+                        "browser_navigation_started",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        step=step.label,
+                        url=page_url,
                     )
+                    # Prefer load over networkidle: the allow-list route aborts off-host
+                    # assets, which can prevent networkidle from ever settling.
+                    try:
+                        response = page.goto(page_url, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("load", timeout=15000)
+                        except Exception as load_error:
+                            log_event(
+                                "browser_navigation_load_wait_timeout",
+                                run_id=run_id,
+                                target_id=target.target_id,
+                                browser_session_id=session_id,
+                                error_category=type(load_error).__name__,
+                                summary=str(load_error),
+                            )
+                    except Exception as navigation_error:
+                        log_event(
+                            "browser_navigation_failed",
+                            run_id=run_id,
+                            target_id=target.target_id,
+                            browser_session_id=session_id,
+                            url=page_url,
+                            error_category=type(navigation_error).__name__,
+                            summary=str(navigation_error),
+                        )
+                        raise
+                    final_url = page.url
+                    title = page.title()
+                    status = response.status if response is not None else None
+                    log_event(
+                        "browser_navigation_completed",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        status=status,
+                        final_url=final_url,
+                        title=title,
+                    )
+                    validate_navigation_url(final_url, target.allowed_hosts)
+                    if response is not None and response.status >= 400:
+                        raise RuntimeError(f"page returned HTTP {response.status}: {page_url}")
+                    axe_result: dict = {"violations": []}
+                    if axe_source:
+                        page.add_script_tag(content=axe_source)
+                        axe_result = page.evaluate(
+                            "async () => await window.axe.run(document, "
+                            "{resultTypes: ['violations']})"
+                        )
                     html = page.content()
+                    if not html or len(html) < 32:
+                        raise RuntimeError(
+                            f"AgentCore page content was empty after navigation to {final_url}"
+                        )
                     soup = BeautifulSoup(html, "html.parser")
                     statuses: dict[str, int] = {}
                     for anchor in soup.select("a[href]")[:20]:
@@ -458,7 +552,8 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                         link_status=lambda href, checked=statuses: checked.get(href, 599),
                     )
                     known_issues = {
-                        (issue.rule, issue.selector) for issue in captured_page.accessibility_issues
+                        (issue.rule, issue.selector)
+                        for issue in captured_page.accessibility_issues
                     }
                     severity_map = {
                         "minor": Severity.LOW,
@@ -498,19 +593,57 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                         raise RuntimeError(
                             "CIVIC_CANARY_S3_BUCKET is required for browser evidence"
                         )
-                    if bucket:
-                        boto3.client("s3", region_name=self.region).put_object(
-                            Bucket=bucket,
-                            Key=page_screenshot_key,
-                            Body=page.screenshot(full_page=True),
-                            ContentType="image/png",
-                        )
-                        captured_page.screenshot_key = page_screenshot_key
-                        screenshot_key = screenshot_key or page_screenshot_key
+                    screenshot_bytes = page.screenshot(full_page=True)
+                    boto3.client("s3", region_name=self.region).put_object(
+                        Bucket=bucket,
+                        Key=page_screenshot_key,
+                        Body=screenshot_bytes,
+                        ContentType="image/png",
+                    )
+                    captured_page.screenshot_key = page_screenshot_key
+                    screenshot_key = screenshot_key or page_screenshot_key
                     pages.append(captured_page)
+                    log_event(
+                        "browser_evidence_captured",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        step=step.label,
+                        final_url=final_url,
+                        title=title,
+                        html_bytes=len(html),
+                        screenshot_key=page_screenshot_key,
+                        headings=len(captured_page.headings),
+                    )
+                if not pages:
+                    raise RuntimeError(
+                        "AgentCore capture finished with zero pages; navigation did not produce evidence"
+                    )
             finally:
-                page.close()
-                browser.close()
+                log_event(
+                    "browser_session_closing",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    pages_captured=len(pages),
+                )
+                try:
+                    if page is not None:
+                        page.close()
+                except Exception:
+                    pass
+                try:
+                    if browser is not None:
+                        browser.close()
+                except Exception:
+                    pass
+                log_event(
+                    "browser_session_closed",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    pages_captured=len(pages),
+                )
         return PortalSnapshot(
             target_id=target.target_id,
             run_id=run_id,
