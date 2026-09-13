@@ -88,6 +88,7 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<Target | null>(null)
   const [sections, setSections] = useState('')
   const [pageEdits, setPageEdits] = useState<DiscoveredPage[]>([])
+  const [setupError, setSetupError] = useState('')
   const [runs, setRuns] = useState<Run[]>([])
   const [findings, setFindings] = useState<Finding[]>([])
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null)
@@ -148,6 +149,24 @@ export default function App() {
 
   const selectedLiveId = target && !isDemoTarget(target) ? target.target_id : liveFocusId
   const selectedLiveForPages = targets.find((item) => item.target_id === selectedLiveId && !isDemoTarget(item))
+  useEffect(() => {
+    if (!selectedLiveForPages?.setup_run_id || selectedLiveForPages.setup_status !== 'FAILED') {
+      setSetupError('')
+      return
+    }
+    let cancelled = false
+    api.run(selectedLiveForPages.setup_run_id, token)
+      .then((run) => {
+        if (!cancelled) setSetupError(run.summary || run.error_category || 'Inspection failed')
+      })
+      .catch(() => {
+        if (!cancelled) setSetupError('')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [selectedLiveForPages?.setup_run_id, selectedLiveForPages?.setup_status, token])
+
   useEffect(() => {
     if (!selectedLiveForPages || selectedLiveForPages.setup_status !== 'AWAITING_CONFIRMATION') return
     if (pageEdits.length > 0) return
@@ -268,6 +287,25 @@ export default function App() {
     for (let attempt = 0; attempt < 150; attempt += 1) {
       if (latest.setup_status === 'AWAITING_CONFIRMATION' || latest.setup_status === 'FAILED' || latest.setup_status === 'ACTIVE') {
         return latest
+      }
+      if (latest.setup_run_id) {
+        try {
+          const run = await api.run(latest.setup_run_id, token)
+          if (run.status === 'FAILED') {
+            // Worker may have failed the run a moment before target.setup_status flips.
+            latest = await api.target(targetId, token)
+            if (latest.setup_status === 'PENDING') {
+              latest = { ...latest, setup_status: 'FAILED' }
+            }
+            return latest
+          }
+          // Missing jobs/*.json leaves QUEUED forever; re-inspect repairs the queue object.
+          if (run.status === 'QUEUED' && attempt > 0 && attempt % 15 === 0) {
+            await api.inspect(targetId, token)
+          }
+        } catch {
+          // Target polling remains the source of truth if the run endpoint blips.
+        }
       }
       await new Promise((resolve) => window.setTimeout(resolve, 2000))
       latest = await api.target(targetId, token)
@@ -596,9 +634,12 @@ export default function App() {
                 </button>
               </>}
               {selectedLive.setup_status === 'FAILED' && (
-                <button disabled={!token || busy} onClick={() => void act(() => api.inspect(selectedLive.target_id, token), 'Inspection queued again.')}>
+                <>
+                  {setupError && <p className="setup-error">{setupError}</p>}
+                  <button disabled={!token || busy} onClick={() => void act(() => api.inspect(selectedLive.target_id, token), 'Inspection queued again.')}>
                   Retry inspection
-                </button>
+                  </button>
+                </>
               )}
             </div>
           )}

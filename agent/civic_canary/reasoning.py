@@ -330,8 +330,14 @@ class StrandsReasoner:
         final = result.results["draft"]
         packet = DecisionPacket.model_validate(final.result.structured_output)
         if baseline is None:
+            # Setup must only propose sections to watch, never change findings.
             if packet.recommendations:
-                raise ValueError("Initial inspection cannot claim a change")
+                LOGGER.warning(
+                    "Ignoring %s setup recommendations that claimed a change run_id=%s",
+                    len(packet.recommendations),
+                    run_id,
+                )
+                packet.recommendations = []
             packet.recommended_sections = resolve_setup_sections(packet, cached["snapshot"])
         findings = grounded_findings(packet, cached["catalog"], target, run_id, guidance)
         timings = [

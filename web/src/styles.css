@@ -399,6 +399,12 @@ button svg, a svg { width: 17px; height: 17px; }
 }
 .setup-status textarea { width: 100%; min-height: 120px; display: block; margin: .75rem 0 1rem; }
 .setup-status .primary-button { width: auto; }
+.setup-error {
+  margin: .65rem 0;
+  color: #8a2f2f;
+  font-weight: 600;
+  line-height: 1.45;
+}
 .discovery-summary {
   margin: .75rem 0 1rem;
   padding: .9rem 1rem;

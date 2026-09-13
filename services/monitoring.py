@@ -145,9 +145,137 @@ async def process_queued_run(store, run_id: str) -> Run:
     return run
 
 
+def _run_age_seconds(run: Run, now: datetime) -> float:
+    started = run.started_at or now
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return max(0.0, (now - started).total_seconds())
+
+
+def recover_setup_queue(store, now: datetime | None = None) -> int:
+    """Keep live onboarding from sitting on PENDING/QUEUED forever.
+
+    - Re-materialize missing jobs/*.json for QUEUED setup runs.
+    - Fail stale QUEUED/RUNNING setup runs and mirror FAILED onto the target.
+    - Sync target.setup_status when the setup run already failed.
+    """
+    now = now or datetime.now(UTC)
+    stale_queued = int(os.getenv("CIVIC_CANARY_STALE_QUEUED_SECONDS", "900"))
+    stale_running = int(os.getenv("CIVIC_CANARY_STALE_RUNNING_SECONDS", "1800"))
+    repaired = 0
+    cursor = None
+    while True:
+        targets, cursor = store.target_page(50, cursor)
+        for target in targets:
+            if target.setup_status not in {"PENDING", "FAILED"}:
+                continue
+            if not target.setup_run_id:
+                continue
+            run = store.get_run(target.setup_run_id)
+            if run is None:
+                if target.setup_status == "PENDING":
+                    target.setup_status = "FAILED"
+                    store.put_target(target)
+                    log_event(
+                        "setup_missing_run_failed",
+                        run_id=target.setup_run_id,
+                        target_id=target.target_id,
+                        summary="Setup run record was missing; marked FAILED",
+                    )
+                    repaired += 1
+                continue
+
+            if run.status == RunStatus.FAILED and target.setup_status == "PENDING":
+                target.setup_status = "FAILED"
+                store.put_target(target)
+                log_event(
+                    "setup_status_synced_failed",
+                    run_id=run.run_id,
+                    target_id=target.target_id,
+                    error_category=run.error_category,
+                    summary=run.summary or "Synced FAILED setup status from run",
+                )
+                repaired += 1
+                continue
+
+            if run.status == RunStatus.QUEUED:
+                job_key = f"jobs/{run.run_id}.json"
+                age = _run_age_seconds(run, now)
+                if store.get_json(job_key) is None:
+                    store.put_json(
+                        job_key, {"run_id": run.run_id, "target_id": target.target_id}
+                    )
+                    log_event(
+                        "setup_job_repaired",
+                        run_id=run.run_id,
+                        target_id=target.target_id,
+                        age_seconds=int(age),
+                        summary="Requeued missing jobs/*.json for PENDING setup",
+                    )
+                    repaired += 1
+                elif age >= stale_queued:
+                    run.status = RunStatus.FAILED
+                    run.finished_at = now
+                    run.error_category = "StaleQueue"
+                    run.summary = (
+                        f"Inspection stayed QUEUED for {int(age)}s without completing; "
+                        "retry inspection."
+                    )
+                    store.put_run(run)
+                    target.setup_status = "FAILED"
+                    store.put_target(target)
+                    store.delete_json(job_key)
+                    index_run(store, run)
+                    log_event(
+                        "setup_stale_queued_failed",
+                        run_id=run.run_id,
+                        target_id=target.target_id,
+                        age_seconds=int(age),
+                        summary=run.summary,
+                    )
+                    repaired += 1
+                continue
+
+            if run.status == RunStatus.RUNNING:
+                age = _run_age_seconds(run, now)
+                if age < stale_running:
+                    continue
+                run.status = RunStatus.FAILED
+                run.finished_at = now
+                run.error_category = "StaleRunning"
+                run.summary = (
+                    f"Inspection stayed RUNNING for {int(age)}s without finishing; "
+                    "retry inspection."
+                )
+                store.put_run(run)
+                target.setup_status = "FAILED"
+                store.put_target(target)
+                store.delete_json(f"jobs/{run.run_id}.json")
+                index_run(store, run)
+                log_event(
+                    "setup_stale_running_failed",
+                    run_id=run.run_id,
+                    target_id=target.target_id,
+                    age_seconds=int(age),
+                    summary=run.summary,
+                )
+                repaired += 1
+        if not cursor:
+            break
+    return repaired
+
+
 async def run_due(store, now=None):
     """Run under the supplied single-worker flock/systemd unit, never inside the web process."""
     now = now or datetime.now(UTC)
+    repaired = recover_setup_queue(store, now)
+    if repaired:
+        log_event(
+            "setup_queue_recovery",
+            run_id="worker",
+            repaired=repaired,
+            summary="Repaired or failed stale live-setup runs",
+        )
     cursor = None
     while True:
         targets, cursor = store.target_page(50, cursor)

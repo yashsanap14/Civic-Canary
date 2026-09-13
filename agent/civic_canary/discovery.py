@@ -247,6 +247,7 @@ class DiscoveryPlanner:
         reason: str,
         depth: int,
         selected: bool = True,
+        path: str | None = None,
     ) -> DiscoveredPage | None:
         canonical = canonicalize_url(page.url)
         if canonical in self.seen_urls:
@@ -279,7 +280,7 @@ class DiscoveryPlanner:
         self.seen_fingerprints.add(fingerprint)
         discovered = DiscoveredPage(
             url=canonical,
-            path=url_path_and_query(canonical),
+            path=path if path is not None else url_path_and_query(canonical),
             label=(label or page.title or "Page")[:200],
             selected=selected,
             reason=reason[:500],
@@ -481,12 +482,16 @@ def discover_pages(
 
     snapshots: list[PageSnapshot] = []
     entry = fetch_page(target.start_url)
+    entry_path = "/"
+    if canonicalize_url(entry.url) != canonicalize_url(target.start_url):
+        entry_path = url_path_and_query(canonicalize_url(entry.url))
     entry_page = planner.register_page(
         entry,
         label="Entry page",
         reason="User-provided starting page",
         depth=0,
         selected=True,
+        path=entry_path,
     )
     snapshots.append(entry)
     if entry_page is None:

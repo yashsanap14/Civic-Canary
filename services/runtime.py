@@ -342,6 +342,7 @@ class ScanService:
                 run_id=run.run_id,
                 target_id=target.target_id,
                 error_category=run.error_category,
+                summary=run.summary,
                 setup_status=getattr(latest or target, "setup_status", None),
             )
             if isinstance(exc, RunExecutionError):

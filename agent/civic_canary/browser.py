@@ -27,11 +27,12 @@ from .models import (
 )
 from .discovery import (
     DiscoveryPlanner,
+    build_discovery_summary,
+    canonicalize_url,
     discovery_enabled_for,
     discovery_max_depth,
     discovery_max_pages,
     discover_pages,
-    build_discovery_summary,
     journey_steps_from_discovery,
     refine_candidates_with_strands,
     url_path_and_query,
@@ -79,6 +80,11 @@ def page_url_for(target: PortalTarget, path: str) -> str:
     # New websites preserve the exact submitted page, including its query string.
     if path == "/" and "{version}" not in target.start_url:
         return base
+    # Live discovery stores host-absolute paths (e.g. /food-help). Joining those as
+    # relative segments onto start_url produced doubled paths like /food-help/food-help.
+    if target.kind == "live" and path.startswith("/"):
+        parsed = urlparse(base)
+        return urljoin(f"{parsed.scheme}://{parsed.netloc}", path)
     return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
 
 
@@ -654,12 +660,16 @@ class HttpBrowserAdapter(BrowserAdapter):
 
                 entry = await async_fetch_page(target.start_url)
                 discovery_snapshots: list[PageSnapshot] = [entry]
+                entry_path = "/"
+                if canonicalize_url(entry.url) != canonicalize_url(target.start_url):
+                    entry_path = url_path_and_query(canonicalize_url(entry.url))
                 entry_page = planner.register_page(
                     entry,
                     label="Entry page",
                     reason="User-provided starting page",
                     depth=0,
                     selected=True,
+                    path=entry_path,
                 )
                 visited = 1
                 if entry_page is not None:

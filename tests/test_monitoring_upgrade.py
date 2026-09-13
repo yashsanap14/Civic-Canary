@@ -786,3 +786,65 @@ async def test_failed_active_scan_resets_next_scan_for_retry(monkeypatch):
     refreshed = store.get_target(configured.target_id)
     assert refreshed.next_scan_at is not None
     assert refreshed.next_scan_at <= datetime.now(UTC) + timedelta(seconds=5)
+
+
+def test_recover_setup_queue_repairs_missing_job_and_syncs_failed(monkeypatch):
+    from agent.civic_canary.models import JourneyStep, PortalTarget, Run, RunStatus, TriggerType
+    from services.monitoring import recover_setup_queue
+
+    store = InMemoryStore()
+    now = datetime.now(UTC)
+    pending = PortalTarget(
+        target_id="site-stuck",
+        name="Stuck",
+        kind="live",
+        start_url="https://example.org/",
+        allowed_hosts=["example.org"],
+        journey_steps=[JourneyStep(path="/", label="Submitted page")],
+        setup_status="PENDING",
+        setup_run_id="run-missing-job",
+        monitoring_objective="Monitor SNAP",
+    )
+    store.put_target(pending)
+    store.put_run(
+        Run(
+            run_id="run-missing-job",
+            target_id="site-stuck",
+            trigger_type=TriggerType.MANUAL,
+            status=RunStatus.QUEUED,
+            started_at=now,
+        )
+    )
+    assert store.get_json("jobs/run-missing-job.json") is None
+    assert recover_setup_queue(store, now) >= 1
+    assert store.get_json("jobs/run-missing-job.json") == {
+        "run_id": "run-missing-job",
+        "target_id": "site-stuck",
+    }
+
+    desynced = PortalTarget(
+        target_id="site-desync",
+        name="Desync",
+        kind="live",
+        start_url="https://example.org/a",
+        allowed_hosts=["example.org"],
+        journey_steps=[JourneyStep(path="/", label="Submitted page")],
+        setup_status="PENDING",
+        setup_run_id="run-already-failed",
+        monitoring_objective="Monitor SNAP",
+    )
+    store.put_target(desynced)
+    store.put_run(
+        Run(
+            run_id="run-already-failed",
+            target_id="site-desync",
+            trigger_type=TriggerType.MANUAL,
+            status=RunStatus.FAILED,
+            started_at=now,
+            finished_at=now,
+            summary="page returned HTTP 404",
+            error_category="RuntimeError",
+        )
+    )
+    assert recover_setup_queue(store, now) >= 1
+    assert store.get_target("site-desync").setup_status == "FAILED"

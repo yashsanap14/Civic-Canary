@@ -244,6 +244,28 @@ def test_discovery_enabled_only_for_live_setup(monkeypatch: pytest.MonkeyPatch) 
     assert discovery_enabled_for(live) is False
 
 
+def test_live_page_url_for_does_not_double_path() -> None:
+    from agent.civic_canary.browser import page_url_for
+    from agent.civic_canary.models import JourneyStep, PortalTarget
+
+    target = PortalTarget(
+        target_id="site-usa",
+        name="usa",
+        kind="live",
+        start_url="https://www.usa.gov/food-help",
+        allowed_hosts=["www.usa.gov"],
+        journey_steps=[
+            JourneyStep(path="/", label="Entry page"),
+            JourneyStep(path="/food-help", label="Food help"),
+            JourneyStep(path="/food-help/snap", label="SNAP"),
+        ],
+        setup_status="PENDING",
+    )
+    assert page_url_for(target, "/") == "https://www.usa.gov/food-help"
+    assert page_url_for(target, "/food-help") == "https://www.usa.gov/food-help"
+    assert page_url_for(target, "/food-help/snap") == "https://www.usa.gov/food-help/snap"
+
+
 def test_content_fingerprint_stable() -> None:
     page = _page("https://example.org/a", "A", [], "Hello   world")
     assert content_fingerprint(page) == content_fingerprint(
