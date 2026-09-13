@@ -11,6 +11,7 @@ import {
   Play,
   RefreshCw,
   ShieldCheck,
+  Trash2,
   X,
 } from 'lucide-react'
 
@@ -20,7 +21,6 @@ import './styles.css'
 const SESSION_KEYS = {
   token: 'civic-canary.review-token',
   targetId: 'civic-canary.target-id',
-  demoFocusId: 'civic-canary.demo-focus-id',
   liveFocusId: 'civic-canary.live-focus-id',
 } as const
 
@@ -56,23 +56,17 @@ function isDemoTarget(target: Target | null | undefined) {
   return target.kind === 'demo' || target.target_id.endsWith('-demo') || target.target_id === 'benefits-demo'
 }
 
-function targetLabel(target: Target) {
-  return isDemoTarget(target) ? target.name : target.name
-}
-
-function demoPortalHref(target: Target | null) {
-  if (!target) return '/portal/v1/index.html'
-  const version = target.active_version ?? 'v1'
-  const namespace = target.fixture_namespace?.trim()
-  return namespace ? `/portal/${namespace}/${version}/index.html` : `/portal/${version}/index.html`
+function setupLabel(status: Target['setup_status']) {
+  if (!status) return 'Unknown'
+  return status.replaceAll('_', ' ')
 }
 
 export default function App() {
   const [target, setTarget] = useState<Target | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
-  const [demoFocusId, setDemoFocusId] = useState(() => readSession(SESSION_KEYS.demoFocusId) || 'benefits-demo')
   const [liveFocusId, setLiveFocusId] = useState(() => readSession(SESSION_KEYS.liveFocusId))
   const [showAdd, setShowAdd] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<Target | null>(null)
   const [sections, setSections] = useState('')
   const [runs, setRuns] = useState<Run[]>([])
   const [findings, setFindings] = useState<Finding[]>([])
@@ -90,30 +84,22 @@ export default function App() {
       api.runs(authToken),
       api.findings(authToken),
     ])
-    setTargets(targetRows)
+    const liveRows = targetRows.filter((item) => !isDemoTarget(item))
+    setTargets(liveRows)
     const preferredId = readSession(SESSION_KEYS.targetId)
     setTarget((current) => {
       const preferred = preferredId
-        ? targetRows.find((row) => row.target_id === preferredId)
+        ? liveRows.find((row) => row.target_id === preferredId)
         : undefined
       return preferred
-        ?? targetRows.find((row) => row.target_id === current?.target_id)
-        ?? targetRows[0]
+        ?? liveRows.find((row) => row.target_id === current?.target_id)
+        ?? liveRows[0]
         ?? null
     })
-    const demos = targetRows.filter((item) => isDemoTarget(item))
-    const lives = targetRows.filter((item) => !isDemoTarget(item))
-    setDemoFocusId((current) => {
-      const next = demos.some((item) => item.target_id === current)
-        ? current
-        : demos[0]?.target_id ?? 'benefits-demo'
-      writeSession(SESSION_KEYS.demoFocusId, next)
-      return next
-    })
     setLiveFocusId((current) => {
-      const next = lives.some((item) => item.target_id === current)
+      const next = liveRows.some((item) => item.target_id === current)
         ? current
-        : lives[0]?.target_id ?? ''
+        : liveRows[0]?.target_id ?? ''
       writeSession(SESSION_KEYS.liveFocusId, next)
       return next
     })
@@ -124,7 +110,7 @@ export default function App() {
     setSelectedFinding((current) =>
       current ? { ...current, ...(findingRows.find((item) => item.finding_id === current.finding_id) ?? {}) } : null,
     )
-    return targetRows
+    return liveRows
   }
 
   useEffect(() => {
@@ -133,11 +119,8 @@ export default function App() {
 
   useEffect(() => {
     if (target?.target_id) writeSession(SESSION_KEYS.targetId, target.target_id)
+    else writeSession(SESSION_KEYS.targetId, '')
   }, [target?.target_id])
-
-  useEffect(() => {
-    writeSession(SESSION_KEYS.demoFocusId, demoFocusId)
-  }, [demoFocusId])
 
   useEffect(() => {
     writeSession(SESSION_KEYS.liveFocusId, liveFocusId)
@@ -153,14 +136,20 @@ export default function App() {
 
   const findingDialogId = selectedFinding?.finding_id
   const runDialogId = selectedRun?.run_id
+  const modalOpen = showAdd || Boolean(pendingDelete)
   useEffect(() => {
-    if (!findingDialogId && !runDialogId && !showAdd) return
+    if (!findingDialogId && !runDialogId && !modalOpen) return
     const previous = document.activeElement as HTMLElement | null
     const dialog = document.querySelector<HTMLElement>('[role="dialog"]')
     const controls = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],textarea,input') ?? [])
     controls()[0]?.focus()
     const handleKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { setSelectedFinding(null); setSelectedRun(null); setShowAdd(false) }
+      if (event.key === 'Escape') {
+        setSelectedFinding(null)
+        setSelectedRun(null)
+        setShowAdd(false)
+        setPendingDelete(null)
+      }
       if (event.key === 'Tab') {
         const items = controls()
         const first = items[0], last = items[items.length - 1]
@@ -170,13 +159,14 @@ export default function App() {
     }
     document.addEventListener('keydown', handleKey)
     return () => { document.removeEventListener('keydown', handleKey); previous?.focus() }
-  }, [findingDialogId, runDialogId, showAdd])
+  }, [findingDialogId, runDialogId, modalOpen])
 
+  const liveTargets = targets
+  const selectedLive = liveTargets.find((item) => item.target_id === liveFocusId)
+    ?? liveTargets.find((item) => item.target_id === target?.target_id)
+    ?? liveTargets[0]
+    ?? null
   const visibleFindings = findings.filter((finding) => finding.target_id === target?.target_id)
-  const demoTargets = targets.filter((item) => isDemoTarget(item))
-  const liveTargets = targets.filter((item) => !isDemoTarget(item))
-  const selectedDemo = demoTargets.find((item) => item.target_id === demoFocusId) ?? demoTargets[0] ?? null
-  const selectedLive = liveTargets.find((item) => item.target_id === liveFocusId) ?? liveTargets[0] ?? null
   const openFindings = useMemo(
     () => findings.filter((finding) => finding.status === 'OPEN' && finding.target_id === target?.target_id),
     [findings, target?.target_id],
@@ -197,11 +187,6 @@ export default function App() {
     }
   }
 
-  const setVersion = (version: 'v1' | 'v2') => {
-    if (!selectedDemo) return
-    void act(() => api.setVersion(version, token, selectedDemo.target_id), `Demo portal switched to ${version.toUpperCase()}.`)
-  }
-
   const runScan = async (targetId = selectedLive?.target_id) => {
     if (!targetId) return
     setBusy(true)
@@ -220,32 +205,6 @@ export default function App() {
       setMessage('Scan complete. Findings are ready for review when material changes were detected.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Something went wrong')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const triggerDemoChange = async () => {
-    if (!selectedDemo) return
-    setBusy(true)
-    setError('')
-    setMessage('')
-    try {
-      await api.setVersion('v2', token, selectedDemo.target_id)
-      const started = await api.startRun(token, selectedDemo.target_id)
-      let run = started.run
-      for (let attempt = 0; run.status === 'QUEUED' || run.status === 'RUNNING'; attempt += 1) {
-        if (attempt >= 150) throw new Error('The demo scan is still running. Check Recent runs shortly.')
-        await new Promise((resolve) => window.setTimeout(resolve, 2000))
-        run = await api.run(run.run_id, token)
-      }
-      const rows = await load()
-      const demo = rows.find((item) => item.target_id === selectedDemo.target_id) ?? null
-      if (demo) setTarget(demo)
-      if (run.status === 'FAILED') throw new Error(run.summary || 'The demo scan failed.')
-      setMessage(`${selectedDemo.name}: V2 change triggered. Findings are ready for review.`)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The demo change could not be triggered')
     } finally {
       setBusy(false)
     }
@@ -318,11 +277,39 @@ export default function App() {
   }
 
   const selectTarget = (targetId: string) => {
-    const next = targets.find((item) => item.target_id === targetId) ?? null
+    const next = liveTargets.find((item) => item.target_id === targetId) ?? null
     setTarget(next)
     setSections('')
-    if (next && isDemoTarget(next)) setDemoFocusId(next.target_id)
-    if (next && !isDemoTarget(next)) setLiveFocusId(next.target_id)
+    if (next) setLiveFocusId(next.target_id)
+  }
+
+  const deleteWebsite = async () => {
+    if (!pendingDelete) return
+    const deletedId = pendingDelete.target_id
+    const deletedName = pendingDelete.name
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      await api.deleteWebsite(deletedId, token)
+      setPendingDelete(null)
+      if (target?.target_id === deletedId) {
+        setTarget(null)
+        writeSession(SESSION_KEYS.targetId, '')
+      }
+      if (liveFocusId === deletedId) {
+        setLiveFocusId('')
+        writeSession(SESSION_KEYS.liveFocusId, '')
+      }
+      setSelectedFinding((current) => (current?.target_id === deletedId ? null : current))
+      setSelectedRun((current) => (current?.target_id === deletedId ? null : current))
+      await load()
+      setMessage(`Removed “${deletedName}” and cleared its monitoring schedule.`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Website could not be deleted')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
@@ -338,86 +325,33 @@ export default function App() {
       <main id="dashboard">
         <section className="hero">
           <div>
-            <p className="kicker">Community website monitoring</p>
+            <p className="kicker">Live website monitoring</p>
             <h1>Only surface changes that matter.</h1>
-            <p className="lede">Civic Canary checks the portal in the background, traces the impact on community guidance, and leaves every consequential decision to a person.</p>
+            <p className="lede">Add public websites, capture a trusted baseline, and review material changes before any guidance is updated.</p>
           </div>
           <div className="hero-status" aria-label="Current target status">
             <span className="pulse" aria-hidden="true" />
-            <div><small>Monitoring</small><strong>{target ? `${targetLabel(target)} · ${isDemoTarget(target) ? 'Demo' : 'Live'}` : 'Loading target…'}</strong></div>
+            <div>
+              <small>Monitoring</small>
+              <strong>{target ? target.name : liveTargets.length === 0 ? 'No websites yet' : 'Select a website'}</strong>
+            </div>
           </div>
         </section>
 
-        <section className="feature-split" aria-label="Monitoring modes">
-          <article className="feature-panel demo-scenario">
-            <p className="kicker">Demo scenarios</p>
-            <h2>Controlled V1 → V2 changes</h2>
-            <p>Pick a synthetic community portal. V1 is the trusted baseline; Trigger Demo Change flips to V2 and runs the same scan → finding → approve/reject workflow.</p>
-            <label htmlFor="demo-select">Demo scenario</label>
-            <select
-              id="demo-select"
-              value={selectedDemo?.target_id ?? ''}
-              onChange={(event) => selectTarget(event.target.value)}
-            >
-              {demoTargets.map((item) => (
-                <option key={item.target_id} value={item.target_id}>{item.name}</option>
-              ))}
-            </select>
-            <p className="feature-hint">{selectedDemo?.change_summary ?? 'Select a demo scenario to see its controlled change.'}</p>
-            <div className="version-switch" aria-label="Demo portal version">
-              {(['v1', 'v2'] as const).map((version) => (
-                <button
-                  key={version}
-                  className={selectedDemo?.active_version === version ? 'active' : ''}
-                  disabled={!token || busy || !selectedDemo}
-                  onClick={() => setVersion(version)}
-                >
-                  {version.toUpperCase()}
-                </button>
-              ))}
+        <section className="live-monitor" aria-label="Live websites">
+          <div className="section-heading">
+            <div>
+              <p className="kicker">Monitored websites</p>
+              <h2>Watch real public pages</h2>
             </div>
-            <div className="feature-actions">
-              <button
-                className="secondary-button"
-                disabled={!token || busy || !selectedDemo}
-                onClick={() => void act(() => api.setVersion('v1', token, selectedDemo?.target_id), 'Demo reset to V1. Run Trigger Demo Change after reviewing the baseline.')}
-              >
-                Reset to V1
-              </button>
-              <button className="primary-button" disabled={!token || busy || !selectedDemo} onClick={() => void triggerDemoChange()}>
-                {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
-                {busy ? 'Working…' : 'Trigger Demo Change'}
-              </button>
-            </div>
-            <a className="portal-link" href={demoPortalHref(selectedDemo)} target="_blank" rel="noreferrer">
-              Open demo portal <ArrowRight aria-hidden="true" />
-            </a>
-          </article>
-
-          <article className="feature-panel live-panel">
-            <p className="kicker">Live websites</p>
-            <h2>Watch real public pages</h2>
-            <p>Fairfax examples and any site you add use the live page as baseline—no scripted V2. Future scans detect real changes and notify only when review is needed.</p>
-            <label htmlFor="website-select">Live website</label>
-            <select
-              id="website-select"
-              value={selectedLive?.target_id ?? ''}
-              onChange={(event) => selectTarget(event.target.value)}
-            >
-              {liveTargets.length === 0 ? (
-                <option value="">No live websites yet</option>
-              ) : liveTargets.map((item) => (
-                <option key={item.target_id} value={item.target_id}>{item.name}</option>
-              ))}
-            </select>
-            <div className="feature-actions">
+            <div className="feature-actions live-heading-actions">
               <button
                 className="primary-button"
                 type="button"
                 disabled={busy}
                 onClick={() => {
                   if (!token) {
-                    setError('Enter your review token under Reviewer Access, then click + Add Live Website.')
+                    setError('Enter your review token under Reviewer Access, then click Add Live Website.')
                     setMessage('')
                     document.getElementById('review-token')?.focus()
                     return
@@ -426,7 +360,7 @@ export default function App() {
                   setShowAdd(true)
                 }}
               >
-                <Globe2 aria-hidden="true" /> + Add Live Website
+                <Globe2 aria-hidden="true" /> Add Live Website
               </button>
               <button
                 className="secondary-button"
@@ -434,54 +368,124 @@ export default function App() {
                 onClick={() => void runScan(selectedLive?.target_id)}
               >
                 {busy ? <RefreshCw className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}
-                {busy ? 'Working…' : 'Scan Live Website Now'}
+                {busy ? 'Working…' : 'Scan Now'}
               </button>
             </div>
-            {!token && (
-              <p className="feature-hint">Review token required before adding or scanning a live website.</p>
-            )}
-            {selectedLive && selectedLive.setup_status && selectedLive.setup_status !== 'ACTIVE' && (
-              <div className="setup-status">
-                <strong>Setup: {selectedLive.setup_status.replaceAll('_', ' ')}</strong>
-                <p>Run: {selectedLive.setup_run_id}</p>
-                {selectedLive.setup_status === 'AWAITING_CONFIRMATION' && <>
-                  <p>The agent found these relevant headings. Accept them or edit one section per line.</p>
-                  <textarea
-                    aria-label="Sections to monitor"
-                    value={sections || (selectedLive.recommended_sections ?? []).join('\n')}
-                    onChange={(event) => setSections(event.target.value)}
-                  />
-                  <button
-                    className="primary-button"
-                    disabled={!token || busy}
-                    onClick={() => void act(
-                      () => api.confirm(selectedLive.target_id, (sections || (selectedLive.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean), token),
-                      'Monitoring confirmed. The background worker will scan on schedule.',
-                    )}
+          </div>
+
+          {!token && (
+            <p className="feature-hint">Review token required before adding, scanning, or deleting a live website.</p>
+          )}
+
+          {liveTargets.length === 0 ? (
+            <div className="empty-state live-empty">
+              <Globe2 aria-hidden="true" />
+              <h3>No websites yet</h3>
+              <p>Add a public HTTPS page to capture a baseline and start scheduled monitoring.</p>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (!token) {
+                    setError('Enter your review token under Reviewer Access, then click Add Live Website.')
+                    document.getElementById('review-token')?.focus()
+                    return
+                  }
+                  setShowAdd(true)
+                }}
+              >
+                <Globe2 aria-hidden="true" /> Add Live Website
+              </button>
+            </div>
+          ) : (
+            <div className="website-grid" role="list">
+              {liveTargets.map((item) => {
+                const selected = item.target_id === (selectedLive?.target_id ?? target?.target_id)
+                return (
+                  <article
+                    key={item.target_id}
+                    className={`website-card${selected ? ' selected' : ''}`}
+                    role="listitem"
                   >
-                    Confirm monitoring
-                  </button>
-                </>}
-                {selectedLive.setup_status === 'FAILED' && (
-                  <button disabled={busy} onClick={() => void act(() => api.inspect(selectedLive.target_id, token), 'Inspection queued again.')}>
-                    Retry inspection
-                  </button>
-                )}
-              </div>
-            )}
-            {selectedLive?.setup_status === 'ACTIVE' && (
-              <p className="feature-hint">Next scan: {formatTime(selectedLive.next_scan_at ?? null)}. First scan captures the real live baseline; later scans look for meaningful drift.</p>
-            )}
-          </article>
+                    <button
+                      type="button"
+                      className="website-card-main"
+                      onClick={() => selectTarget(item.target_id)}
+                      aria-pressed={selected}
+                    >
+                      <span className="website-card-title">
+                        <strong>{item.name}</strong>
+                        <span className={`setup-pill status-${(item.setup_status ?? 'PENDING').toLowerCase()}`}>
+                          {setupLabel(item.setup_status)}
+                        </span>
+                      </span>
+                      <small className="website-url">{item.start_url || 'Public website'}</small>
+                      <span className="website-meta">
+                        Every {item.scan_frequency_minutes ?? '—'} min
+                        {item.setup_status === 'ACTIVE' ? ` · Next ${formatTime(item.next_scan_at ?? null)}` : ''}
+                      </span>
+                    </button>
+                    <div className="website-card-actions">
+                      <button
+                        type="button"
+                        className="danger-button"
+                        disabled={!token || busy}
+                        onClick={() => setPendingDelete(item)}
+                        aria-label={`Delete ${item.name}`}
+                      >
+                        <Trash2 aria-hidden="true" /> Delete
+                      </button>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          )}
+
+          {selectedLive && selectedLive.setup_status && selectedLive.setup_status !== 'ACTIVE' && (
+            <div className="setup-status">
+              <strong>Setup: {setupLabel(selectedLive.setup_status)}</strong>
+              <p>Run: {selectedLive.setup_run_id || 'Not started'}</p>
+              {selectedLive.setup_status === 'AWAITING_CONFIRMATION' && <>
+                <p>The agent found these relevant headings. Accept them or edit one section per line.</p>
+                <textarea
+                  aria-label="Sections to monitor"
+                  value={sections || (selectedLive.recommended_sections ?? []).join('\n')}
+                  onChange={(event) => setSections(event.target.value)}
+                />
+                <button
+                  className="primary-button"
+                  disabled={!token || busy}
+                  onClick={() => void act(
+                    () => api.confirm(selectedLive.target_id, (sections || (selectedLive.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean), token),
+                    'Monitoring confirmed. The background worker will scan on schedule.',
+                  )}
+                >
+                  Confirm monitoring
+                </button>
+              </>}
+              {selectedLive.setup_status === 'FAILED' && (
+                <button disabled={!token || busy} onClick={() => void act(() => api.inspect(selectedLive.target_id, token), 'Inspection queued again.')}>
+                  Retry inspection
+                </button>
+              )}
+            </div>
+          )}
+          {selectedLive?.setup_status === 'ACTIVE' && (
+            <p className="feature-hint">
+              Next scan: {formatTime(selectedLive.next_scan_at ?? null)}. First scan captures the live baseline; later scans look for meaningful drift.
+            </p>
+          )}
         </section>
 
         <section className="metrics" aria-label="Summary">
           <article><small>Open decisions</small><strong>{openFindings.length}</strong><span>Need a human</span></article>
           <article><small>Latest run</small><strong>{runs.find((row) => row.target_id === target?.target_id)?.status ?? '—'}</strong><span>{formatTime(runs.find((row) => row.target_id === target?.target_id)?.finished_at ?? null)}</span></article>
           <article>
-            <small>{isDemoTarget(target) ? 'Portal version' : 'Scan frequency'}</small>
-            <strong>{isDemoTarget(target) ? target?.active_version.toUpperCase() : `${target?.scan_frequency_minutes ?? '—'} min`}</strong>
-            <span>{isDemoTarget(target) ? 'Synthetic demo' : 'Public website'}</span>
+            <small>Scan frequency</small>
+            <strong>{target ? `${target.scan_frequency_minutes ?? '—'} min` : '—'}</strong>
+            <span>Public website</span>
           </article>
         </section>
 
@@ -493,15 +497,17 @@ export default function App() {
             </div>
 
             <div className="finding-list">
-              {visibleFindings.length === 0 ? (
+              {!target ? (
+                <div className="empty-state">
+                  <Globe2 aria-hidden="true" />
+                  <h3>Select a website</h3>
+                  <p>Choose a monitored site to review findings and recent scans.</p>
+                </div>
+              ) : visibleFindings.length === 0 ? (
                 <div className="empty-state">
                   <FileCheck2 aria-hidden="true" />
                   <h3>No findings yet</h3>
-                  <p>
-                    {isDemoTarget(target)
-                      ? 'Use Trigger Demo Change to reveal the controlled V2 regressions.'
-                      : 'No decisions for this website. Confirm setup, then let scheduled monitoring run.'}
-                  </p>
+                  <p>No decisions for this website. Confirm setup, then let scheduled monitoring run.</p>
                 </div>
               ) : visibleFindings.map((finding) => (
                 <button className="finding-card" key={finding.finding_id} onClick={() => void openFinding(finding)}>
@@ -517,7 +523,7 @@ export default function App() {
               <div><p className="kicker">Audit trail</p><h2>Recent runs</h2></div>
             </div>
             <div className="run-list">
-              {runs.filter((run) => run.target_id === target?.target_id).map((run) => (
+              {target && runs.filter((run) => run.target_id === target.target_id).map((run) => (
                 <button key={run.run_id} className="run-row" onClick={() => setSelectedRun(run)}>
                   <span className="run-icon"><Clock3 aria-hidden="true" /></span>
                   <span><strong>{run.trigger_type.toLowerCase()} scan</strong><small>{formatTime(run.finished_at)}</small></span>
@@ -554,7 +560,7 @@ export default function App() {
               Clear token
             </button>
             <p className="privacy-note">Saved for this browser tab only (survives refresh). Cleared when the tab closes, or use Clear token.</p>
-            {target && !isDemoTarget(target) && (
+            {target?.start_url && (
               <a className="portal-link" href={target.start_url} target="_blank" rel="noreferrer">
                 Open live website <ArrowRight aria-hidden="true" />
               </a>
@@ -587,6 +593,33 @@ export default function App() {
                 <button className="primary-button" disabled={busy}>{busy ? 'Adding…' : 'Add and Inspect'}</button>
               </div>
             </form>
+          </section>
+        </div>
+      )}
+
+      {pendingDelete && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => !busy && setPendingDelete(null)}>
+          <section
+            className="website-modal confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-live-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button className="close-button" type="button" disabled={busy} onClick={() => setPendingDelete(null)} aria-label="Cancel delete"><X aria-hidden="true" /></button>
+            <p className="kicker">Remove website</p>
+            <h2 id="delete-live-title">Delete “{pendingDelete.name}”?</h2>
+            <p>
+              This removes the website from monitoring, cancels its schedule, and deletes related findings,
+              runs, and evidence for this target only. This cannot be undone.
+            </p>
+            <p className="feature-hint">{pendingDelete.start_url}</p>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" disabled={busy} onClick={() => setPendingDelete(null)}>Cancel</button>
+              <button type="button" className="danger-button" disabled={busy} onClick={() => void deleteWebsite()}>
+                {busy ? 'Deleting…' : 'Delete website'}
+              </button>
+            </div>
           </section>
         </div>
       )}

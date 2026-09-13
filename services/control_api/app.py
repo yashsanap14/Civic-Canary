@@ -51,7 +51,7 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type", "X-Review-Token"],
     )
 
@@ -129,6 +129,64 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         if not target:
             raise HTTPException(404, "Website not found")
         return target
+
+    def _is_demo_target(target: PortalTarget) -> bool:
+        return (
+            target.kind == "demo"
+            or target.target_id.endswith("-demo")
+            or target.target_id == "benefits-demo"
+        )
+
+    @app.delete("/api/targets/{target_id}", dependencies=[Depends(require_token)])
+    def delete_website(target_id: str):
+        target = app.state.store.get_target(target_id)
+        if not target:
+            raise HTTPException(404, "Website not found")
+        if _is_demo_target(target) or target.kind != "live":
+            raise HTTPException(403, "Demo scenarios cannot be deleted from the live dashboard")
+
+        active_runs = [
+            run
+            for run in app.state.store.list_runs()
+            if run.target_id == target_id and run.status in {"QUEUED", "RUNNING"}
+        ]
+        if any(run.status == "RUNNING" for run in active_runs):
+            raise HTTPException(
+                409,
+                "A scan is currently running for this website. Try again after it finishes.",
+            )
+
+        # Drop queued jobs for this target before removing the site row so workers
+        # cannot pick up orphaned work after deletion.
+        for run in active_runs:
+            try:
+                app.state.store.delete_json(f"jobs/{run.run_id}.json")
+            except Exception:
+                pass
+
+        try:
+            summary = app.state.store.delete_target(target_id)
+        except Exception as exc:
+            log_event(
+                "target_delete_failed",
+                run_id=f"delete-{target_id}",
+                target_id=target_id,
+                error_category=type(exc).__name__,
+                summary=str(exc),
+            )
+            raise HTTPException(
+                502,
+                "The website could not be deleted completely. Check storage permissions and try again.",
+            ) from exc
+
+        log_event(
+            "target_deleted",
+            run_id=f"delete-{target_id}",
+            target_id=target_id,
+            name=target.name,
+            **{key: value for key, value in summary.items() if isinstance(value, int)},
+        )
+        return {"ok": True, "target_id": target_id, "deleted": summary}
 
     @app.post("/api/targets/{target_id}/inspect", dependencies=[Depends(require_token)])
     async def inspect_website(target_id: str):

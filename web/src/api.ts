@@ -131,6 +131,9 @@ export const api = {
   addWebsite: (data: Record<string, unknown>, token: string) => request<Target>('/api/targets', {
     method: 'POST', headers: protectedHeaders(token), body: JSON.stringify(data),
   }),
+  deleteWebsite: (id: string, token: string) => request<{ ok: boolean; target_id: string }>(`/api/targets/${id}`, {
+    method: 'DELETE', headers: protectedHeaders(token),
+  }),
   confirm: (id: string, sections: string[], token: string) => request<Target>(`/api/targets/${id}/confirm`, {
     method: 'POST', headers: protectedHeaders(token), body: JSON.stringify({ monitored_sections: sections }),
   }),

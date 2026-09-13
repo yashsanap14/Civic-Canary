@@ -127,6 +127,10 @@ class Store(ABC):
     def delete_json(self, key: str) -> None:
         raise NotImplementedError
 
+    def delete_target(self, target_id: str) -> dict[str, int]:
+        """Remove a target and records that belong only to that target_id."""
+        raise NotImplementedError
+
     def read_artifact(self, key: str) -> str:
         raise NotImplementedError
 
@@ -295,6 +299,84 @@ class InMemoryStore(Store):
 
     def delete_json(self, key: str) -> None:
         self.json_objects.pop(key, None)
+
+    def delete_target(self, target_id: str) -> dict[str, int]:
+        with self._lock:
+            target = self.targets.get(target_id)
+            if target is None:
+                return {"targets": 0}
+
+            runs = [run for run in self.runs.values() if run.target_id == target_id]
+            findings = [
+                finding for finding in self.findings.values() if finding.target_id == target_id
+            ]
+            run_ids = {run.run_id for run in runs}
+            finding_ids = {finding.finding_id for finding in findings}
+
+            jobs_removed = 0
+            for run_id in run_ids:
+                job_key = f"jobs/{run_id}.json"
+                if job_key in self.json_objects:
+                    self.json_objects.pop(job_key, None)
+                    jobs_removed += 1
+
+            recent_removed = 0
+            for key in list(self.json_objects):
+                if not key.startswith("recent-runs/"):
+                    continue
+                payload = self.json_objects.get(key) or {}
+                if payload.get("target_id") == target_id or any(
+                    key.endswith(f"-{run_id}.json") for run_id in run_ids
+                ):
+                    self.json_objects.pop(key, None)
+                    recent_removed += 1
+
+            outbox_removed = 0
+            notifications_removed = 0
+            artifacts_removed = 0
+            for finding_id in finding_ids:
+                for prefix in ("outbox/", "notification-events/", "notification-claims/"):
+                    key = f"{prefix}{finding_id}.json"
+                    if key in self.json_objects:
+                        self.json_objects.pop(key, None)
+                        if prefix == "outbox/":
+                            outbox_removed += 1
+                        else:
+                            notifications_removed += 1
+                artifact_key = f"approved/{finding_id}.md"
+                if artifact_key in self.artifacts:
+                    self.artifacts.pop(artifact_key, None)
+                    artifacts_removed += 1
+                self.findings.pop(finding_id, None)
+
+            reviews_removed = 0
+            for review_id, review in list(self.reviews.items()):
+                if (
+                    review.get("findingId") in finding_ids
+                    or review.get("siteId") == target_id
+                    or review_id in {f"review-{finding_id}" for finding_id in finding_ids}
+                ):
+                    self.reviews.pop(review_id, None)
+                    reviews_removed += 1
+
+            for run_id in run_ids:
+                self.runs.pop(run_id, None)
+                self.snapshots.pop(run_id, None)
+
+            self.baselines.pop(target_id, None)
+            self.targets.pop(target_id, None)
+
+            return {
+                "targets": 1,
+                "runs": len(run_ids),
+                "findings": len(finding_ids),
+                "reviews": reviews_removed,
+                "jobs": jobs_removed,
+                "recent_runs": recent_removed,
+                "outbox": outbox_removed,
+                "notifications": notifications_removed,
+                "artifacts": artifacts_removed,
+            }
 
     def read_artifact(self, key: str) -> str:
         return self.artifacts[key]
@@ -611,6 +693,104 @@ class AwsStore(Store):
 
     def delete_json(self, key: str) -> None:
         self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def _delete_s3_prefix(self, prefix: str) -> int:
+        """Delete objects under an exact prefix. Prefix must already be target-scoped."""
+        if not prefix or ".." in prefix:
+            raise ValueError("Refusing to delete an unsafe S3 prefix")
+        removed = 0
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            objects = [{"Key": item["Key"]} for item in page.get("Contents", []) if item.get("Key")]
+            if not objects:
+                continue
+            # delete_objects accepts up to 1000 keys per call
+            for index in range(0, len(objects), 1000):
+                batch = objects[index : index + 1000]
+                self.s3.delete_objects(Bucket=self.bucket, Delete={"Objects": batch})
+                removed += len(batch)
+        return removed
+
+    def _delete_s3_key_if_exists(self, key: str) -> int:
+        try:
+            self.s3.delete_object(Bucket=self.bucket, Key=key)
+            return 1
+        except ClientError:
+            return 0
+
+    def delete_target(self, target_id: str) -> dict[str, int]:
+        target = self.get_target(target_id)
+        if target is None:
+            return {"targets": 0}
+
+        runs = [run for run in self.list_runs() if run.target_id == target_id]
+        findings = [finding for finding in self.list_findings() if finding.target_id == target_id]
+        run_ids = {run.run_id for run in runs}
+        finding_ids = {finding.finding_id for finding in findings}
+
+        jobs_removed = 0
+        for run_id in run_ids:
+            job_key = f"jobs/{run_id}.json"
+            if self.get_json(job_key) is not None:
+                self.delete_json(job_key)
+                jobs_removed += 1
+
+        recent_removed = 0
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix="recent-runs/"):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key", "")
+                if not key.endswith(".json"):
+                    continue
+                payload = self.get_json(key) or {}
+                if payload.get("target_id") == target_id or any(
+                    key.endswith(f"-{run_id}.json") for run_id in run_ids
+                ):
+                    self.delete_json(key)
+                    recent_removed += 1
+
+        outbox_removed = 0
+        notifications_removed = 0
+        artifacts_removed = 0
+        for finding_id in finding_ids:
+            for prefix in ("outbox/", "notification-events/", "notification-claims/"):
+                key = f"{prefix}{finding_id}.json"
+                if self.get_json(key) is not None:
+                    self.delete_json(key)
+                    if prefix == "outbox/":
+                        outbox_removed += 1
+                    else:
+                        notifications_removed += 1
+            artifacts_removed += self._delete_s3_key_if_exists(f"approved/{finding_id}.md")
+            self.findings.delete_item(Key={"findingId": finding_id})
+            self.reviews.delete_item(Key={"reviewId": f"review-{finding_id}"})
+
+        runs_removed = 0
+        for run in runs:
+            run_key = getattr(self, "_run_key", lambda run_id: f"runs/{run_id}.json")(run.run_id)
+            runs_removed += self._delete_s3_key_if_exists(run_key)
+
+        evidence_removed = 0
+        evidence_removed += self._delete_s3_key_if_exists(f"baselines/{target_id}.json")
+        evidence_removed += self._delete_s3_prefix(f"baselines/{target_id}/")
+        evidence_removed += self._delete_s3_prefix(f"snapshots/{target_id}/")
+        evidence_removed += self._delete_s3_prefix(f"screenshots/{target_id}/")
+        if target.playbook_key.startswith(f"playbooks/{target_id}/"):
+            evidence_removed += self._delete_s3_prefix(f"playbooks/{target_id}/")
+
+        self.sites.delete_item(Key={"siteId": target_id})
+
+        return {
+            "targets": 1,
+            "runs": runs_removed,
+            "findings": len(finding_ids),
+            "jobs": jobs_removed,
+            "recent_runs": recent_removed,
+            "outbox": outbox_removed,
+            "notifications": notifications_removed,
+            "artifacts": artifacts_removed,
+            "evidence_objects": evidence_removed,
+        }
 
     def read_artifact(self, key: str) -> str:
         return self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read().decode()

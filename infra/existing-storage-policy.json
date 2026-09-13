@@ -7,6 +7,7 @@
       "Action": [
         "dynamodb:GetItem",
         "dynamodb:PutItem",
+        "dynamodb:DeleteItem",
         "dynamodb:Scan",
         "dynamodb:TransactWriteItems"
       ],
@@ -47,6 +48,22 @@
       "Resource": [
         "arn:aws:s3:::civic-canary/jobs/*",
         "arn:aws:s3:::civic-canary/outbox/*"
+      ]
+    },
+    {
+      "Sid": "RemoveDeletedTargetArtifacts",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": [
+        "arn:aws:s3:::civic-canary/runs/*",
+        "arn:aws:s3:::civic-canary/baselines/*",
+        "arn:aws:s3:::civic-canary/snapshots/*",
+        "arn:aws:s3:::civic-canary/screenshots/*",
+        "arn:aws:s3:::civic-canary/approved/*",
+        "arn:aws:s3:::civic-canary/recent-runs/*",
+        "arn:aws:s3:::civic-canary/notification-events/*",
+        "arn:aws:s3:::civic-canary/notification-claims/*",
+        "arn:aws:s3:::civic-canary/playbooks/*"
       ]
     }
   ]
