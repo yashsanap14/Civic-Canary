@@ -23,6 +23,18 @@ from .models import (
     PortalSnapshot,
     PortalTarget,
     Severity,
+    SkippedDiscoveryItem,
+)
+from .discovery import (
+    DiscoveryPlanner,
+    discovery_enabled_for,
+    discovery_max_depth,
+    discovery_max_pages,
+    discover_pages,
+    build_discovery_summary,
+    journey_steps_from_discovery,
+    refine_candidates_with_strands,
+    url_path_and_query,
 )
 
 
@@ -404,6 +416,15 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def url_path_matches(page_url: str, selected_paths: set[str]) -> bool:
+    path = url_path_and_query(page_url)
+    if path in selected_paths:
+        return True
+    # Tolerate trailing-slash differences between discovery and capture.
+    trimmed = path.rstrip("/") or "/"
+    return any((candidate.rstrip("/") or "/") == trimmed for candidate in selected_paths)
+
+
 def _page_from_html(
     html: str,
     *,
@@ -554,15 +575,15 @@ class HttpBrowserAdapter(BrowserAdapter):
     async def capture(self, target: PortalTarget, run_id: str) -> PortalSnapshot:
         validate_target(target)
         onboarding = target.setup_status in {"PENDING", "FAILED"}
-        pages: list[PageSnapshot] = []
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds, follow_redirects=False
         ) as client:
-            for step in target.journey_steps:
-                page_url = page_url_for(target, step.path)
-                validate_navigation_url(page_url, target.allowed_hosts)
-                submitted_url = page_url
-                redirect_chain = [page_url]
+
+            async def fetch_html(url: str) -> tuple[str, str]:
+                """Return (final_url, html) following safe redirects."""
+                page_url = url
+                submitted_url = url
+                redirect_chain = [url]
                 response = None
                 for _ in range(6):
                     response = await client.get(
@@ -606,8 +627,140 @@ class HttpBrowserAdapter(BrowserAdapter):
                         target_id=target.target_id,
                         redirect_chain=redirect_chain,
                     )
+                return page_url, response.text
 
-                async def check_link(href: str, base_page_url: str = page_url) -> int:
+            if discovery_enabled_for(target):
+                max_pages = discovery_max_pages()
+                max_depth = discovery_max_depth()
+                planner = DiscoveryPlanner(
+                    objective=target.monitoring_objective,
+                    allowed_hosts={host.lower() for host in target.allowed_hosts},
+                    max_pages=max_pages,
+                    max_depth=max_depth,
+                )
+
+                async def async_fetch_page(url: str) -> PageSnapshot:
+                    final_url, html = await fetch_html(url)
+
+                    def link_status(href: str) -> int:
+                        if not href or href.startswith(("#", "mailto:", "tel:")):
+                            return 200
+                        linked = urljoin(final_url, href)
+                        if urlparse(linked).hostname not in target.allowed_hosts:
+                            return 403
+                        return 200
+
+                    return _page_from_html(html, url=final_url, link_status=link_status)
+
+                entry = await async_fetch_page(target.start_url)
+                discovery_snapshots: list[PageSnapshot] = [entry]
+                entry_page = planner.register_page(
+                    entry,
+                    label="Entry page",
+                    reason="User-provided starting page",
+                    depth=0,
+                    selected=True,
+                )
+                visited = 1
+                if entry_page is not None:
+                    frontier = planner.consider_links(page=entry, depth=0)
+                    strands_order = await asyncio.to_thread(
+                        refine_candidates_with_strands,
+                        objective=target.monitoring_objective,
+                        entry_title=entry.title,
+                        candidates=[
+                            (item.url, item.text, item.score) for item in frontier
+                        ],
+                        limit=max_pages - 1,
+                    )
+                    if strands_order:
+                        by_url = {item.url: item for item in frontier}
+                        frontier = [
+                            by_url[url] for url in strands_order if url in by_url
+                        ] + [
+                            item
+                            for item in frontier
+                            if item.url not in set(strands_order)
+                        ]
+                    queue = list(frontier)
+                    while queue and len(planner.selected) < max_pages:
+                        candidate = queue.pop(0)
+                        if candidate.depth > max_depth or candidate.url in planner.seen_urls:
+                            continue
+                        try:
+                            page = await async_fetch_page(candidate.url)
+                        except Exception as exc:  # noqa: BLE001
+                            planner.skipped.append(
+                                SkippedDiscoveryItem(
+                                    label=candidate.text,
+                                    reason=f"navigation failed: {type(exc).__name__}",
+                                    url=candidate.url,
+                                )
+                            )
+                            continue
+                        visited += 1
+                        discovered = planner.register_page(
+                            page,
+                            label=candidate.text or page.title,
+                            reason=f"Relevant to objective (score {candidate.score:.1f})",
+                            depth=candidate.depth,
+                            selected=True,
+                        )
+                        if discovered is None:
+                            continue
+                        discovery_snapshots.append(page)
+                        if candidate.depth < max_depth and len(planner.selected) < max_pages:
+                            for child in planner.consider_links(
+                                page=page, depth=candidate.depth
+                            ):
+                                if child.url not in planner.seen_urls and child.url not in {
+                                    item.url for item in queue
+                                }:
+                                    queue.append(child)
+                        queue.sort(key=lambda item: (-item.score, item.depth, item.url))
+                        queue = queue[: max_pages * 2]
+
+                summary = build_discovery_summary(
+                    website_name=target.name,
+                    entry_url=target.start_url,
+                    objective=target.monitoring_objective,
+                    pages=list(planner.selected),
+                    skipped=planner.skipped,
+                    pages_visited=visited,
+                    max_pages=max_pages,
+                )
+                target.discovery_summary = summary
+                target.journey_steps = journey_steps_from_discovery(summary)
+                _browser_journal(
+                    "discovery_completed",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    pages=len(summary.discovered_pages),
+                    skipped=len(summary.skipped),
+                    summary="Objective-guided discovery updated journey_steps",
+                )
+                # Reuse pages already fetched during discovery for the baseline snapshot.
+                selected_paths = {step.path for step in target.journey_steps}
+                pages = [
+                    page
+                    for page in discovery_snapshots
+                    if url_path_matches(page.url, selected_paths)
+                ] or discovery_snapshots[:1]
+                return PortalSnapshot(
+                    target_id=target.target_id,
+                    run_id=run_id,
+                    version="live",
+                    pages=pages,
+                    content_hash=_snapshot_hash(pages),
+                )
+
+            pages: list[PageSnapshot] = []
+            for step in target.journey_steps:
+                page_url = page_url_for(target, step.path)
+                validate_navigation_url(page_url, target.allowed_hosts)
+                final_url, html = await fetch_html(page_url)
+
+                async def check_link(href: str, base_page_url: str = final_url) -> int:
                     if not href or href.startswith(("#", "mailto:", "tel:")):
                         return 200
                     linked = urljoin(base_page_url, href)
@@ -625,15 +778,15 @@ class HttpBrowserAdapter(BrowserAdapter):
                     except httpx.HTTPError:
                         return 599
 
-                soup = BeautifulSoup(response.text, "html.parser")
+                soup = BeautifulSoup(html, "html.parser")
                 statuses = {
                     node.get("href", ""): await check_link(node.get("href", ""))
                     for node in soup.select("a[href]")
                 }
                 pages.append(
                     _page_from_html(
-                        response.text,
-                        url=page_url,
+                        html,
+                        url=final_url,
                         link_status=lambda href, checked=statuses: checked.get(href, 599),
                     )
                 )
@@ -822,6 +975,70 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
                     page_url_before=url_before,
                     summary="Reusing AgentCore default instrumented page",
                 )
+                if discovery_enabled_for(target):
+                    def discovery_fetch(url: str) -> PageSnapshot:
+                        validate_navigation_url(url, target.allowed_hosts)
+                        page.goto(url, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("load", timeout=15000)
+                        except Exception:
+                            pass
+                        final_url = page.url
+                        onboarding = target.setup_status in {"PENDING", "FAILED"}
+                        try:
+                            validate_navigation_url(final_url, target.allowed_hosts)
+                        except UnsafeTargetError:
+                            if not onboarding:
+                                raise
+                            target.allowed_hosts = incorporate_final_navigation_host(
+                                submitted_url=url,
+                                final_url=final_url,
+                                allowed_hosts=target.allowed_hosts,
+                                onboarding=True,
+                                run_id=run_id,
+                                target_id=target.target_id,
+                                redirect_chain=[url, final_url],
+                            )
+                        html = page.content()
+                        if not html or len(html) < 32:
+                            raise RuntimeError(
+                                f"AgentCore page content was empty after navigation to {final_url}"
+                            )
+                        return _page_from_html(
+                            html,
+                            url=final_url,
+                            link_status=lambda href: (
+                                200
+                                if not href or href.startswith(("#", "mailto:", "tel:"))
+                                else (
+                                    403
+                                    if urlparse(urljoin(final_url, href)).hostname
+                                    not in target.allowed_hosts
+                                    else 200
+                                )
+                            ),
+                        )
+
+                    def discovery_go_back() -> None:
+                        page.go_back(wait_until="domcontentloaded")
+
+                    _planned, summary = discover_pages(
+                        target=target,
+                        fetch_page=discovery_fetch,
+                        go_back=discovery_go_back,
+                    )
+                    target.discovery_summary = summary
+                    target.journey_steps = journey_steps_from_discovery(summary)
+                    _browser_journal(
+                        "discovery_completed",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        pages=len(summary.discovered_pages),
+                        skipped=len(summary.skipped),
+                        max_pages=summary.max_pages,
+                        summary="Objective-guided discovery updated journey_steps",
+                    )
                 try:
                     for index, step in enumerate(target.journey_steps):
                         page_url = page_url_for(target, step.path)

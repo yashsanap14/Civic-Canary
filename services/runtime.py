@@ -165,13 +165,21 @@ class ScanService:
                         latest.allowed_hosts = list(
                             dict.fromkeys([*latest.allowed_hosts, *target.allowed_hosts])
                         )
+                        latest.journey_steps = list(target.journey_steps)
+                        latest.discovery_summary = target.discovery_summary
                         latest.recommended_sections = trace["packet"]["recommended_sections"]
                         latest.setup_status = "AWAITING_CONFIRMATION"
                         latest.setup_run_id = resolved_run_id
                         self.store.put_target(latest)
                         target = latest
+                        page_count = len(latest.journey_steps)
                         run.status = RunStatus.SUCCEEDED
-                        run.summary = "Baseline captured. Confirm the sections to monitor."
+                        run.summary = (
+                            f"Discovered {page_count} page(s) for monitoring. "
+                            "Confirm the pages and sections to watch."
+                            if latest.discovery_summary
+                            else "Baseline captured. Confirm the sections to monitor."
+                        )
                         run.finished_at = datetime.now(UTC)
                         run.notification_status = "NOT_REQUIRED"
                         run.monitoring_brief = build_monitoring_brief(
@@ -188,6 +196,8 @@ class ScanService:
                             run_id=resolved_run_id,
                             target_id=target.target_id,
                             sections=len(target.recommended_sections),
+                            pages=page_count,
+                            discovery=bool(latest.discovery_summary),
                         )
                         return run, []
             else:
@@ -217,7 +227,13 @@ class ScanService:
                     target.setup_run_id = resolved_run_id
                     self.store.put_target(target)
                     run.status = RunStatus.SUCCEEDED
-                    run.summary = "Baseline captured. Confirm the sections to monitor."
+                    page_count = len(target.journey_steps)
+                    run.summary = (
+                        f"Discovered {page_count} page(s) for monitoring. "
+                        "Confirm the pages and sections to watch."
+                        if target.discovery_summary
+                        else "Baseline captured. Confirm the sections to monitor."
+                    )
                     run.finished_at = datetime.now(UTC)
                     run.reasoning_source = "http-baseline"
                     run.monitoring_brief = build_monitoring_brief(

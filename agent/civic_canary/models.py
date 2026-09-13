@@ -126,6 +126,36 @@ class JourneyStep(BaseModel):
         return value
 
 
+class DiscoveredPage(BaseModel):
+    """One page chosen (or proposed) during objective-guided discovery."""
+
+    url: str = Field(min_length=8, max_length=2048)
+    path: str = Field(min_length=1, max_length=2048)
+    label: str = Field(min_length=1, max_length=200)
+    selected: bool = True
+    reason: str = Field(default="", max_length=500)
+    depth: int = Field(default=0, ge=0, le=10)
+    content_fingerprint: str | None = None
+
+
+class SkippedDiscoveryItem(BaseModel):
+    label: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=200)
+    url: str | None = Field(default=None, max_length=2048)
+
+
+class DiscoverySummary(BaseModel):
+    """Human-readable discovery result shown before monitoring confirmation."""
+
+    website_name: str = ""
+    entry_url: str = Field(min_length=8, max_length=2048)
+    monitoring_objective: str = Field(min_length=1, max_length=2000)
+    discovered_pages: list[DiscoveredPage] = Field(default_factory=list, max_length=20)
+    skipped: list[SkippedDiscoveryItem] = Field(default_factory=list, max_length=50)
+    pages_visited: int = 0
+    max_pages: int = 5
+
+
 class PortalTarget(BaseModel):
     description: str = ""
 
@@ -138,6 +168,8 @@ class PortalTarget(BaseModel):
     recommended_sections: list[str] = Field(default_factory=list)
 
     monitored_sections: list[str] = Field(default_factory=list)
+
+    discovery_summary: DiscoverySummary | None = None
 
     setup_status: Literal["ACTIVE", "PENDING", "AWAITING_CONFIRMATION", "FAILED"] = "ACTIVE"
 
@@ -490,8 +522,25 @@ class AddWebsiteRequest(BaseModel):
     guidance_context: str = Field(default="", max_length=20000)
 
 
+class MonitoredPageEdit(BaseModel):
+    """Allow reviewers to keep, drop, or relabel discovered monitoring pages."""
+
+    path: str = Field(min_length=1, max_length=2048)
+    label: str = Field(min_length=1, max_length=200)
+    url: str | None = Field(default=None, max_length=2048)
+    selected: bool = True
+
+    @field_validator("path")
+    @classmethod
+    def safe_path(cls, value: str) -> str:
+        if not value.startswith("/") or ".." in value:
+            raise ValueError("page paths must be absolute and cannot traverse directories")
+        return value
+
+
 class ConfirmMonitoringRequest(BaseModel):
     monitored_sections: list[str] = Field(min_length=1, max_length=20)
+    monitored_pages: list[MonitoredPageEdit] | None = Field(default=None, max_length=20)
 
     @field_validator("monitored_sections")
     @classmethod

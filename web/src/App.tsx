@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react'
 
-import { api, type Finding, type MonitoringBrief, type Run, type Target } from './api'
+import { api, type DiscoveredPage, type Finding, type MonitoringBrief, type Run, type Target } from './api'
 import './styles.css'
 
 const SESSION_KEYS = {
@@ -87,6 +87,7 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<Target | null>(null)
   const [sections, setSections] = useState('')
+  const [pageEdits, setPageEdits] = useState<DiscoveredPage[]>([])
   const [runs, setRuns] = useState<Run[]>([])
   const [findings, setFindings] = useState<Finding[]>([])
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null)
@@ -144,6 +145,17 @@ export default function App() {
   useEffect(() => {
     writeSession(SESSION_KEYS.liveFocusId, liveFocusId)
   }, [liveFocusId])
+
+  const selectedLiveId = target && !isDemoTarget(target) ? target.target_id : liveFocusId
+  const selectedLiveForPages = targets.find((item) => item.target_id === selectedLiveId && !isDemoTarget(item))
+  useEffect(() => {
+    if (!selectedLiveForPages || selectedLiveForPages.setup_status !== 'AWAITING_CONFIRMATION') return
+    if (pageEdits.length > 0) return
+    const discovered = selectedLiveForPages.discovery_summary?.discovered_pages
+    if (discovered && discovered.length > 0) {
+      setPageEdits(discovered.map((page) => ({ ...page })))
+    }
+  }, [selectedLiveForPages, pageEdits.length])
 
   useEffect(() => {
     // Restore dashboard data after refresh, including a saved review token.
@@ -301,6 +313,22 @@ export default function App() {
     const next = liveTargets.find((item) => item.target_id === targetId) ?? null
     setTarget(next)
     setSections('')
+    const discovered = next?.discovery_summary?.discovered_pages
+    if (discovered && discovered.length > 0) {
+      setPageEdits(discovered.map((page) => ({ ...page })))
+    } else if (next?.journey_steps?.length) {
+      setPageEdits(
+        next.journey_steps.map((step) => ({
+          url: next.start_url ?? step.path,
+          path: step.path,
+          label: step.label,
+          selected: true,
+          reason: 'Configured monitoring page',
+        })),
+      )
+    } else {
+      setPageEdits([])
+    }
     if (next) setLiveFocusId(next.target_id)
   }
 
@@ -402,7 +430,7 @@ export default function App() {
             <div className="empty-state live-empty">
               <Globe2 aria-hidden="true" />
               <h3>No websites yet</h3>
-              <p>Add a public HTTPS page to capture a baseline and start scheduled monitoring.</p>
+              <p>Add a public HTTPS website or parent page. Civic Canary discovers relevant pages from your monitoring objective, then you confirm or edit the link list.</p>
               <button
                 className="primary-button"
                 type="button"
@@ -470,6 +498,74 @@ export default function App() {
               <p>Run: {selectedLive.setup_run_id || 'Not started'}</p>
               <p className="feature-hint">You can delete this website at any time, including while inspection is running.</p>
               {selectedLive.setup_status === 'AWAITING_CONFIRMATION' && <>
+                {selectedLive.discovery_summary && (
+                  <div className="discovery-summary">
+                    <p className="kicker">Discovery summary</p>
+                    <p>
+                      <strong>Website:</strong> {selectedLive.discovery_summary.website_name || selectedLive.name}
+                    </p>
+                    <p>
+                      <strong>Monitoring objective:</strong>{' '}
+                      {selectedLive.discovery_summary.monitoring_objective || selectedLive.monitoring_objective}
+                    </p>
+                    <h3>Discovered pages</h3>
+                    <p className="feature-hint">
+                      Keep, drop, or edit labels/paths before confirming. Later scans revisit these same pages.
+                    </p>
+                    <ul className="discovery-page-list">
+                      {pageEdits.map((page, index) => (
+                        <li key={`${page.path}-${index}`}>
+                          <label className="discovery-page-row">
+                            <input
+                              type="checkbox"
+                              checked={page.selected}
+                              onChange={(event) => {
+                                const next = [...pageEdits]
+                                next[index] = { ...page, selected: event.target.checked }
+                                setPageEdits(next)
+                              }}
+                            />
+                            <span className="discovery-page-fields">
+                              <input
+                                aria-label={`Label for ${page.path}`}
+                                value={page.label}
+                                onChange={(event) => {
+                                  const next = [...pageEdits]
+                                  next[index] = { ...page, label: event.target.value }
+                                  setPageEdits(next)
+                                }}
+                              />
+                              <input
+                                aria-label={`Path for ${page.label}`}
+                                value={page.path}
+                                onChange={(event) => {
+                                  const next = [...pageEdits]
+                                  next[index] = { ...page, path: event.target.value }
+                                  setPageEdits(next)
+                                }}
+                              />
+                              <small>{page.url}</small>
+                            </span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                    {(selectedLive.discovery_summary.skipped?.length ?? 0) > 0 && (
+                      <div className="discovery-skipped">
+                        <h3>Skipped</h3>
+                        <ul>
+                          {Array.from(
+                            new Set(
+                              selectedLive.discovery_summary.skipped.map((item) => item.reason),
+                            ),
+                          ).map((reason) => (
+                            <li key={reason}>- {reason}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <p>The agent found these relevant headings. Accept them or edit one section per line.</p>
                 <textarea
                   aria-label="Sections to monitor"
@@ -480,7 +576,19 @@ export default function App() {
                   className="primary-button"
                   disabled={!token || busy}
                   onClick={() => void act(
-                    () => api.confirm(selectedLive.target_id, (sections || (selectedLive.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean), token),
+                    () => api.confirm(
+                      selectedLive.target_id,
+                      (sections || (selectedLive.recommended_sections ?? []).join('\n')).split('\n').filter(Boolean),
+                      token,
+                      pageEdits.length
+                        ? pageEdits.map((page) => ({
+                            path: page.path,
+                            label: page.label,
+                            url: page.url,
+                            selected: page.selected,
+                          }))
+                        : undefined,
+                    ),
                     'Monitoring confirmed. The background worker will scan on schedule.',
                   )}
                 >
@@ -679,7 +787,7 @@ export default function App() {
             <p>Civic Canary validates the public HTTPS URL, inspects with AgentCore Browser, analyzes with Strands, creates the first baseline, and schedules future scans.</p>
             <form className="website-form" onSubmit={(event) => void addWebsite(event)}>
               <label>Website name<input name="name" required maxLength={200} placeholder="City benefits portal" /></label>
-              <label>Public URL<input name="public_url" type="url" required placeholder="https://example.org/services" /></label>
+              <label>Public URL<input name="public_url" type="url" required placeholder="https://www.dss.virginia.gov/" /></label>
               <label className="wide-field">What to monitor<textarea name="objective" required minLength={3} maxLength={2000} placeholder="Changes that affect our clients or guidance" /></label>
               <label>Scan frequency<select name="frequency" defaultValue="1440"><option value="60">Hourly</option><option value="1440">Daily</option><option value="10080">Weekly</option><option value="43200">Monthly</option></select></label>
               <input name="description" type="hidden" value="Live public website" readOnly />

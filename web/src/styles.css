@@ -399,6 +399,51 @@ button svg, a svg { width: 17px; height: 17px; }
 }
 .setup-status textarea { width: 100%; min-height: 120px; display: block; margin: .75rem 0 1rem; }
 .setup-status .primary-button { width: auto; }
+.discovery-summary {
+  margin: .75rem 0 1rem;
+  padding: .9rem 1rem;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #d5e0d9;
+}
+.discovery-summary h3 {
+  margin: 1rem 0 .35rem;
+  font-size: 1rem;
+}
+.discovery-page-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: .65rem;
+}
+.discovery-page-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .65rem;
+  align-items: start;
+  font-weight: 500;
+}
+.discovery-page-fields {
+  display: grid;
+  gap: .35rem;
+}
+.discovery-page-fields input {
+  width: 100%;
+  border: 1px solid #c9d5ce;
+  border-radius: 8px;
+  padding: .45rem .6rem;
+  background: #fbfcfb;
+}
+.discovery-page-fields small {
+  color: #6a7b73;
+  word-break: break-all;
+}
+.discovery-skipped ul {
+  margin: .25rem 0 0;
+  padding-left: 1rem;
+  color: #6a7b73;
+}
 .modal-backdrop {
   position: fixed;
   inset: 0;

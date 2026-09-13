@@ -1,3 +1,33 @@
+export type JourneyStep = {
+  path: string
+  label: string
+}
+
+export type DiscoveredPage = {
+  url: string
+  path: string
+  label: string
+  selected: boolean
+  reason?: string
+  depth?: number
+}
+
+export type SkippedDiscoveryItem = {
+  label: string
+  reason: string
+  url?: string | null
+}
+
+export type DiscoverySummary = {
+  website_name: string
+  entry_url: string
+  monitoring_objective: string
+  discovered_pages: DiscoveredPage[]
+  skipped: SkippedDiscoveryItem[]
+  pages_visited: number
+  max_pages: number
+}
+
 export type Target = {
   target_id: string
   name: string
@@ -12,6 +42,8 @@ export type Target = {
   scan_frequency_minutes?: number
   recommended_sections?: string[]
   monitored_sections?: string[]
+  journey_steps?: JourneyStep[]
+  discovery_summary?: DiscoverySummary | null
   setup_status?: 'ACTIVE' | 'PENDING' | 'AWAITING_CONFIRMATION' | 'FAILED'
   setup_run_id?: string
   next_scan_at?: string
@@ -166,8 +198,18 @@ export const api = {
   }),
   latestBrief: (id: string, token = '') =>
     request<MonitoringBrief>(`/api/targets/${id}/monitoring-brief`, { headers: protectedHeaders(token) }),
-  confirm: (id: string, sections: string[], token: string) => request<Target>(`/api/targets/${id}/confirm`, {
-    method: 'POST', headers: protectedHeaders(token), body: JSON.stringify({ monitored_sections: sections }),
+  confirm: (
+    id: string,
+    sections: string[],
+    token: string,
+    pages?: Array<{ path: string; label: string; url?: string; selected: boolean }>,
+  ) => request<Target>(`/api/targets/${id}/confirm`, {
+    method: 'POST',
+    headers: protectedHeaders(token),
+    body: JSON.stringify({
+      monitored_sections: sections,
+      ...(pages ? { monitored_pages: pages } : {}),
+    }),
   }),
   inspect: (id: string, token: string) => request<{ run: Run }>(`/api/targets/${id}/inspect`, {
     method: 'POST', headers: protectedHeaders(token),

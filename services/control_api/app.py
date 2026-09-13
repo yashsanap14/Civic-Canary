@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, st
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from agent.civic_canary.discovery import apply_page_edits
 from agent.civic_canary.engine import RunExecutionError
 from agent.civic_canary.models import (
     AddWebsiteRequest,
@@ -293,6 +294,19 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         if app.state.store.get_baseline(target_id) is None:
             raise HTTPException(409, "Baseline evidence is missing")
         target.monitored_sections = request.monitored_sections
+        if request.monitored_pages is not None:
+            selected = [page for page in request.monitored_pages if page.selected]
+            if not selected:
+                raise HTTPException(422, "Select at least one page to monitor")
+            summary, steps = apply_page_edits(
+                target.discovery_summary,
+                request.monitored_pages,
+                fallback_entry_url=target.start_url,
+                objective=target.monitoring_objective,
+                website_name=target.name,
+            )
+            target.discovery_summary = summary
+            target.journey_steps = steps
         target.setup_status = "ACTIVE"
         target.next_scan_at = datetime.now(UTC) + timedelta(minutes=target.scan_frequency_minutes)
         app.state.store.put_target(target)
