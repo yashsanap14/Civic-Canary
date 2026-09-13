@@ -6,6 +6,7 @@ from agent.civic_canary.analysis import detect_changes
 from agent.civic_canary.browser import (
     FixtureBrowserAdapter,
     UnsafeTargetError,
+    agentcore_request_should_continue,
     request_is_allowed,
     validate_target,
 )
@@ -62,6 +63,12 @@ def test_browser_policy_blocks_writes_off_host_and_forbidden_journeys() -> None:
     assert request_is_allowed("GET", "https://benefits.example.gov/help", allowed)
     assert not request_is_allowed("POST", "https://benefits.example.gov/apply", allowed)
     assert not request_is_allowed("GET", "https://analytics.example/collect", allowed)
+    assert agentcore_request_should_continue(
+        "PUT",
+        "https://recordings.s3.us-east-1.amazonaws.com/browser-recordings/batch",
+        "xhr",
+        allowed,
+    )
     with pytest.raises(UnsafeTargetError):
         validate_target(
             PortalTarget(

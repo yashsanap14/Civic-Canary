@@ -116,6 +116,9 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
     monkeypatch.setenv("AGENTCORE_BROWSER_ID", "mock-browser")
     monkeypatch.setenv("CIVIC_CANARY_S3_BUCKET", "civic-canary-evidence")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AGENTCORE_REPLAY_FLUSH_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_REPLAY_SETTLE_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_DEFAULT_PAGE_WAIT_SECONDS", "0")
     monkeypatch.setattr(
         "socket.getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("93.184.216.34", 443))]
     )
@@ -134,6 +137,7 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
             self.url = "about:blank"
             self._title = ""
             self.goto_calls: list[tuple[str, str]] = []
+            self.closed = False
 
         def goto(self, url, wait_until="load"):
             self.goto_calls.append((url, wait_until))
@@ -160,7 +164,7 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
             return b"png-bytes"
 
         def close(self):
-            return None
+            self.closed = True
 
     class FakeRequest:
         def head(self, *args, **kwargs):
@@ -174,8 +178,8 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
             self.pages = [page]
             self.request = FakeRequest()
             self.routes = []
+            self.route_handlers = []
             self.handlers = []
-            self.new_context_called = False
 
         def set_default_timeout(self, value):
             return None
@@ -185,6 +189,7 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
 
         def route(self, pattern, handler):
             self.routes.append(pattern)
+            self.route_handlers.append(handler)
 
         def on(self, event, handler):
             self.handlers.append((event, handler))
@@ -236,6 +241,16 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
         def generate_ws_headers(self):
             return "wss://example.agentcore/session", {"Authorization": "sigv4"}
 
+        def get_browser(self, browser_id):
+            return {
+                "browserId": browser_id,
+                "status": "READY",
+                "recording": {
+                    "enabled": True,
+                    "s3Location": {"bucket": "civic-canary", "prefix": "browser-recordings/"},
+                },
+            }
+
     page = FakePage()
     context = FakeContext(page)
     browser = FakeBrowser(context)
@@ -275,7 +290,60 @@ def test_agentcore_capture_uses_default_context_and_produces_page(monkeypatch) -
     assert result.pages[0].screenshot_key
     assert put_calls and put_calls[0]["Body"] == b"png-bytes"
     assert browser.closed
+    assert page.closed is False, "default instrumented page must stay open until session stop"
+    assert context.route_handlers, "allow-list route must be installed"
 
+    class FakeRoute:
+        def __init__(self, method, url, resource_type="xhr"):
+            self.request = MagicMock(method=method, url=url, resource_type=resource_type)
+            self.continued = False
+            self.aborted = False
+
+        def continue_(self):
+            self.continued = True
+
+        def abort(self, _reason=None):
+            self.aborted = True
+
+    guard = context.route_handlers[0]
+    recording = FakeRoute(
+        "PUT",
+        "https://civic-canary.s3.us-east-1.amazonaws.com/browser-recordings/batch.ndjson.gz",
+    )
+    guard(recording)
+    assert recording.continued and not recording.aborted
+
+    extension = FakeRoute("GET", "chrome-extension://agentcore-replay/content.js", "script")
+    guard(extension)
+    assert extension.continued and not extension.aborted
+
+    blocked = FakeRoute("GET", "https://evil.example/track.js", "script")
+    guard(blocked)
+    assert blocked.aborted and not blocked.continued
+
+
+def test_agentcore_replay_route_allows_recording_traffic() -> None:
+    from agent.civic_canary.browser import agentcore_request_should_continue
+
+    allowed = ["example.org"]
+    assert agentcore_request_should_continue(
+        "PUT",
+        "https://bucket.s3.us-east-1.amazonaws.com/browser-recordings/x",
+        "xhr",
+        allowed,
+    )
+    assert agentcore_request_should_continue(
+        "GET", "chrome-extension://abc/replay.js", "script", allowed
+    )
+    assert agentcore_request_should_continue(
+        "GET", "wss://example.org/socket", "websocket", allowed
+    )
+    assert not agentcore_request_should_continue(
+        "GET", "https://tracker.example/pixel.gif", "image", allowed
+    )
+    assert agentcore_request_should_continue(
+        "GET", "https://example.org/page", "document", allowed
+    )
 
 def test_agentcore_capture_rejects_empty_html(monkeypatch) -> None:
     from agent.civic_canary.models import JourneyStep, PortalTarget
@@ -283,6 +351,9 @@ def test_agentcore_capture_rejects_empty_html(monkeypatch) -> None:
     monkeypatch.setenv("AGENTCORE_BROWSER_ID", "mock-browser")
     monkeypatch.setenv("CIVIC_CANARY_S3_BUCKET", "civic-canary-evidence")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AGENTCORE_REPLAY_FLUSH_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_REPLAY_SETTLE_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_DEFAULT_PAGE_WAIT_SECONDS", "0")
     monkeypatch.setattr(
         "socket.getaddrinfo", lambda *a, **k: [(0, 0, 0, "", ("93.184.216.34", 443))]
     )
@@ -365,6 +436,13 @@ def test_agentcore_capture_rejects_empty_html(monkeypatch) -> None:
         def generate_ws_headers(self):
             return "wss://example.agentcore/session", {"Authorization": "sigv4"}
 
+        def get_browser(self, browser_id):
+            return {
+                "browserId": browser_id,
+                "status": "READY",
+                "recording": {"enabled": True, "s3Location": {"bucket": "civic-canary"}},
+            }
+
     monkeypatch.setattr(
         "bedrock_agentcore.tools.browser_client.browser_session",
         lambda *a, **k: FakeClient(),
@@ -380,6 +458,85 @@ def test_agentcore_capture_rejects_empty_html(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="empty"):
         adapter._capture_sync(target, "run-empty")
+
+
+def test_agentcore_refuses_new_page_when_default_missing(monkeypatch) -> None:
+    """Session Replay requires pages[0]; new_page() would produce Pages (0)."""
+    from agent.civic_canary.models import JourneyStep, PortalTarget
+
+    monkeypatch.setenv("AGENTCORE_BROWSER_ID", "mock-browser")
+    monkeypatch.setenv("CIVIC_CANARY_S3_BUCKET", "civic-canary-evidence")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AGENTCORE_REPLAY_FLUSH_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_REPLAY_SETTLE_SECONDS", "0")
+    monkeypatch.setenv("AGENTCORE_DEFAULT_PAGE_WAIT_SECONDS", "0")
+
+    class FakeContext:
+        pages: list = []
+
+        def set_default_timeout(self, value):
+            return None
+
+        def set_default_navigation_timeout(self, value):
+            return None
+
+        def route(self, *args, **kwargs):
+            raise AssertionError("route must not run before default page is resolved")
+
+        def on(self, *args, **kwargs):
+            return None
+
+        def new_page(self):
+            raise AssertionError("context.new_page() bypasses AgentCore Session Replay")
+
+    class FakeBrowser:
+        def __init__(self):
+            self.contexts = [FakeContext()]
+
+        def close(self):
+            return None
+
+    class FakePlaywright:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        @property
+        def chromium(self):
+            return MagicMock(connect_over_cdp=lambda *a, **k: FakeBrowser())
+
+    class FakeClient:
+        session_id = "session-no-page"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def generate_ws_headers(self):
+            return "wss://example.agentcore/session", {"Authorization": "sigv4"}
+
+        def get_browser(self, browser_id):
+            return {"browserId": browser_id, "recording": {"enabled": True}}
+
+    monkeypatch.setattr(
+        "bedrock_agentcore.tools.browser_client.browser_session",
+        lambda *a, **k: FakeClient(),
+    )
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: FakePlaywright())
+    adapter = AgentCoreBrowserAdapter(identifier="mock-browser", region="us-east-1")
+    target = PortalTarget(
+        target_id="live-nopage",
+        kind="live",
+        start_url="https://example.org/services",
+        allowed_hosts=["example.org"],
+        journey_steps=[JourneyStep(path="/", label="Home")],
+    )
+    with pytest.raises(RuntimeError, match="Refusing context.new_page"):
+        adapter._capture_sync(target, "run-nopage")
 
 
 def test_store_factory_supports_civic_canary_table_names(monkeypatch) -> None:

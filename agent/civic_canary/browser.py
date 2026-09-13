@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import socket
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -127,6 +129,74 @@ def request_is_allowed(method: str, url: str, allowed_hosts: list[str]) -> bool:
     except UnsafeTargetError:
         return False
     return True
+
+
+def agentcore_request_should_continue(method: str, url: str, resource_type: str, allowed_hosts: list[str]) -> bool:
+    """Allow page allow-list traffic plus AgentCore Session Replay internals.
+
+    Session Replay extensions upload DOM/CDP batches with non-GET methods to AWS
+    endpoints. Aborting those requests (or chrome-extension:// / websocket traffic)
+    leaves a terminated session with Pages (0) even when page.goto() succeeded.
+    """
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme in {"chrome-extension", "chrome", "data", "blob", "about"}:
+        return True
+    if resource_type in {"websocket", "eventsource", "manifest", "serviceworker"}:
+        return True
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host and (
+        host == "amazonaws.com"
+        or host.endswith(".amazonaws.com")
+        or host == "amazon.com"
+        or host.endswith(".amazon.com")
+        or "bedrock-agentcore" in host
+    ):
+        return True
+    return request_is_allowed(method, url, allowed_hosts)
+
+
+def _browser_journal(event: str, *, run_id: str, **details: object) -> None:
+    """Emit browser lifecycle logs to both structured logging and stdout (journalctl)."""
+    from services.observability import log_event
+
+    payload = {"event": event, "run_id": run_id, **details}
+    line = json.dumps(payload, separators=(",", ":"), default=str)
+    # systemd/journalctl captures process stdout from the EC2 worker.
+    print(f"[civic_canary] {line}", flush=True)
+    log_event(event, run_id=run_id, **details)
+
+
+def _wait_for_default_replay_page(context, *, run_id: str, target_id: str, session_id: str | None):
+    """Return the instrumented default page; never create an unrecorded page.
+
+    AgentCore Session Replay attaches only to the pre-existing default context/page.
+    Official guidance: ``page = browser.contexts[0].pages[0]``. Calling
+    ``context.new_page()`` creates a tab the replay extension does not instrument,
+    which yields Pages (0) in the AWS console even when capture succeeds.
+    """
+    wait_seconds = float(os.getenv("AGENTCORE_DEFAULT_PAGE_WAIT_SECONDS", "15"))
+    deadline = time.monotonic() + max(wait_seconds, 0.0)
+    while True:
+        pages = list(context.pages)
+        _browser_journal(
+            "browser_default_page_poll",
+            run_id=run_id,
+            target_id=target_id,
+            browser_session_id=session_id,
+            page_count=len(pages),
+            wait_seconds=wait_seconds,
+        )
+        if pages:
+            return pages[0]
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    raise RuntimeError(
+        "AgentCore default page was not available after "
+        f"{wait_seconds:.0f}s; Session Replay requires browser.contexts[0].pages[0]. "
+        "Refusing context.new_page() because it bypasses replay instrumentation (Pages 0)."
+    )
 
 
 def _normalize_text(value: str) -> str:
@@ -370,14 +440,12 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
         from bedrock_agentcore.tools.browser_client import browser_session
         from playwright.sync_api import sync_playwright
 
-        from services.observability import log_event
-
         pages: list[PageSnapshot] = []
         screenshot_key: str | None = None
         axe_path = Path(__file__).resolve().parents[1] / "fixtures" / "axe.min.js"
         axe_source = axe_path.read_text(encoding="utf-8") if axe_path.is_file() else None
         if axe_source is None:
-            log_event(
+            _browser_journal(
                 "browser_axe_missing",
                 run_id=run_id,
                 target_id=target.target_id,
@@ -385,265 +453,390 @@ class AgentCoreBrowserAdapter(BrowserAdapter):
             )
 
         session_id: str | None = None
-        browser = None
-        page = None
-        with (
-            browser_session(self.region, identifier=self.identifier) as client,
-            sync_playwright() as playwright,
-        ):
+        # Keep the AgentCore session alive after Playwright disconnects so recording
+        # batches can flush before StopBrowserSession (nested withs, not combined).
+        with browser_session(self.region, identifier=self.identifier) as client:
             session_id = getattr(client, "session_id", None)
-            log_event(
+            _browser_journal(
                 "browser_session_created",
                 run_id=run_id,
                 target_id=target.target_id,
                 browser_session_id=session_id,
                 browser_id=self.identifier,
             )
-            ws_url, headers = client.generate_ws_headers()
-            browser = playwright.chromium.connect_over_cdp(ws_url, headers=headers)
-            # AgentCore Session Replay / Web Bot Auth only attach to the default CDP context.
-            # Creating browser.new_context() yields an empty replay (Pages 0) with no recording.
-            if not browser.contexts:
-                raise RuntimeError(
-                    "AgentCore Browser connected without a default context; cannot record navigation"
-                )
-            context = browser.contexts[0]
-            log_event(
-                "browser_connected",
-                run_id=run_id,
-                target_id=target.target_id,
-                browser_session_id=session_id,
-                contexts=len(browser.contexts),
-                open_pages=len(context.pages),
-            )
-
-            def guard_route(route) -> None:
-                request = route.request
-                unsafe_resource = request.resource_type in {"websocket", "serviceworker"}
-                unsafe_request = not request_is_allowed(
-                    request.method, request.url, target.allowed_hosts
-                )
-                if unsafe_resource or unsafe_request:
-                    route.abort("blockedbyclient")
-                    return
-                try:
-                    if urlparse(request.url).scheme == "https":
-                        validate_public_url(request.url.split("#")[0])
-                except (ValueError, OSError):
-                    route.abort("blockedbyclient")
-                    return
-                route.continue_()
-
-            context.set_default_timeout(20000)
-            context.set_default_navigation_timeout(45000)
-            context.route("**/*", guard_route)
-            page = context.pages[0] if context.pages else context.new_page()
-            kept_pages = {id(page)}
-
-            def close_unexpected_popup(popup) -> None:
-                if id(popup) in kept_pages:
-                    return
-                try:
-                    popup.close()
-                except Exception:
-                    return
-
-            context.on("page", close_unexpected_popup)
-            log_event(
-                "browser_page_ready",
-                run_id=run_id,
-                target_id=target.target_id,
-                browser_session_id=session_id,
-                page_count=len(context.pages),
-            )
             try:
-                for index, step in enumerate(target.journey_steps):
-                    page_url = page_url_for(target, step.path)
-                    validate_navigation_url(page_url, target.allowed_hosts)
-                    log_event(
-                        "browser_navigation_started",
+                browser_info = client.get_browser(self.identifier)
+                recording = browser_info.get("recording") or {}
+                s3_location = recording.get("s3Location") or {}
+                recording_enabled = bool(recording.get("enabled"))
+                _browser_journal(
+                    "browser_recording_config",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    browser_id=self.identifier,
+                    recording_enabled=recording_enabled,
+                    recording_bucket=s3_location.get("bucket") or s3_location.get("Bucket"),
+                    recording_prefix=(
+                        s3_location.get("prefix")
+                        or s3_location.get("keyPrefix")
+                        or s3_location.get("Prefix")
+                    ),
+                    browser_status=browser_info.get("status"),
+                )
+                if not recording_enabled:
+                    _browser_journal(
+                        "browser_recording_disabled",
                         run_id=run_id,
                         target_id=target.target_id,
                         browser_session_id=session_id,
-                        step=step.label,
-                        url=page_url,
+                        browser_id=self.identifier,
+                        summary=(
+                            "AGENTCORE_BROWSER_ID browser does not have session recording enabled; "
+                            "AWS Session Replay will show Pages (0)"
+                        ),
                     )
-                    # Prefer load over networkidle: the allow-list route aborts off-host
-                    # assets, which can prevent networkidle from ever settling.
-                    try:
-                        response = page.goto(page_url, wait_until="domcontentloaded")
+            except Exception as recording_error:
+                _browser_journal(
+                    "browser_recording_config_unavailable",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    browser_id=self.identifier,
+                    error_category=type(recording_error).__name__,
+                    summary=str(recording_error),
+                )
+
+            with sync_playwright() as playwright:
+                browser = None
+                page = None
+                context = None
+                page_reused = False
+                ws_url, headers = client.generate_ws_headers()
+                browser = playwright.chromium.connect_over_cdp(ws_url, headers=headers)
+                # AgentCore Session Replay only attaches to the default CDP context/page.
+                if not browser.contexts:
+                    raise RuntimeError(
+                        "AgentCore Browser connected without a default context; cannot record navigation"
+                    )
+                context = browser.contexts[0]
+                _browser_journal(
+                    "browser_connected",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    context_count=len(browser.contexts),
+                    page_count_before=len(context.pages),
+                    summary="CDP connect_over_cdp succeeded",
+                )
+
+                def guard_route(route) -> None:
+                    request = route.request
+                    if not agentcore_request_should_continue(
+                        request.method,
+                        request.url,
+                        request.resource_type,
+                        target.allowed_hosts,
+                    ):
+                        route.abort("blockedbyclient")
+                        return
+                    if request_is_allowed(request.method, request.url, target.allowed_hosts):
                         try:
-                            page.wait_for_load_state("load", timeout=15000)
-                        except Exception as load_error:
-                            log_event(
-                                "browser_navigation_load_wait_timeout",
-                                run_id=run_id,
-                                target_id=target.target_id,
-                                browser_session_id=session_id,
-                                error_category=type(load_error).__name__,
-                                summary=str(load_error),
-                            )
-                    except Exception as navigation_error:
-                        log_event(
-                            "browser_navigation_failed",
+                            if urlparse(request.url).scheme == "https":
+                                validate_public_url(request.url.split("#")[0])
+                        except (ValueError, OSError):
+                            route.abort("blockedbyclient")
+                            return
+                    route.continue_()
+
+                context.set_default_timeout(20000)
+                context.set_default_navigation_timeout(45000)
+                # Resolve the instrumented default page BEFORE installing routes so we
+                # never fall back to context.new_page() (unrecorded tab → Pages 0).
+                page = _wait_for_default_replay_page(
+                    context,
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    session_id=session_id,
+                )
+                page_reused = True
+                context.route("**/*", guard_route)
+                kept_pages = {id(page)}
+                url_before = ""
+                try:
+                    url_before = page.url
+                except Exception:
+                    url_before = ""
+
+                def close_unexpected_popup(popup) -> None:
+                    if id(popup) in kept_pages:
+                        return
+                    try:
+                        popup.close()
+                    except Exception:
+                        return
+
+                context.on("page", close_unexpected_popup)
+                _browser_journal(
+                    "browser_page_ready",
+                    run_id=run_id,
+                    target_id=target.target_id,
+                    browser_session_id=session_id,
+                    context_count=len(browser.contexts),
+                    page_count_before=len(context.pages),
+                    page_reused=True,
+                    page_created=False,
+                    page_url_before=url_before,
+                    summary="Reusing AgentCore default instrumented page",
+                )
+                try:
+                    for index, step in enumerate(target.journey_steps):
+                        page_url = page_url_for(target, step.path)
+                        validate_navigation_url(page_url, target.allowed_hosts)
+                        try:
+                            current_url = page.url
+                        except Exception:
+                            current_url = url_before
+                        _browser_journal(
+                            "browser_navigation_started",
                             run_id=run_id,
                             target_id=target.target_id,
                             browser_session_id=session_id,
-                            url=page_url,
-                            error_category=type(navigation_error).__name__,
-                            summary=str(navigation_error),
+                            step=step.label,
+                            target_url=page_url,
+                            page_url_before=current_url,
+                            page_reused=page_reused,
+                            context_count=len(browser.contexts),
+                            page_count_before=len(context.pages),
                         )
-                        raise
-                    final_url = page.url
-                    title = page.title()
-                    status = response.status if response is not None else None
-                    log_event(
-                        "browser_navigation_completed",
-                        run_id=run_id,
-                        target_id=target.target_id,
-                        browser_session_id=session_id,
-                        status=status,
-                        final_url=final_url,
-                        title=title,
-                    )
-                    validate_navigation_url(final_url, target.allowed_hosts)
-                    if response is not None and response.status >= 400:
-                        raise RuntimeError(f"page returned HTTP {response.status}: {page_url}")
-                    axe_result: dict = {"violations": []}
-                    if axe_source:
-                        page.add_script_tag(content=axe_source)
-                        axe_result = page.evaluate(
-                            "async () => await window.axe.run(document, "
-                            "{resultTypes: ['violations']})"
-                        )
-                    html = page.content()
-                    if not html or len(html) < 32:
-                        raise RuntimeError(
-                            f"AgentCore page content was empty after navigation to {final_url}"
-                        )
-                    soup = BeautifulSoup(html, "html.parser")
-                    statuses: dict[str, int] = {}
-                    for anchor in soup.select("a[href]")[:20]:
-                        href = anchor.get("href", "")
-                        linked = urljoin(page.url, href)
-                        if not href or href.startswith(("#", "mailto:", "tel:")):
-                            statuses[href] = 200
-                        elif not request_is_allowed("HEAD", linked, target.allowed_hosts):
-                            statuses[href] = 403
-                        else:
+                        try:
+                            response = page.goto(page_url, wait_until="domcontentloaded")
                             try:
-                                validate_public_url(linked.split("#")[0])
-                                linked_response = context.request.head(
-                                    linked, max_redirects=0, timeout=1500
+                                page.wait_for_load_state("load", timeout=15000)
+                            except Exception as load_error:
+                                _browser_journal(
+                                    "browser_navigation_load_wait_timeout",
+                                    run_id=run_id,
+                                    target_id=target.target_id,
+                                    browser_session_id=session_id,
+                                    error_category=type(load_error).__name__,
+                                    summary=str(load_error),
                                 )
-                                if linked_response.status in {405, 501}:
-                                    linked_response = context.request.get(
-                                        linked,
-                                        headers={"Range": "bytes=0-0"},
-                                        max_redirects=0,
-                                        timeout=1500,
-                                    )
-                                statuses[href] = linked_response.status
-                            except Exception:
-                                statuses[href] = 599
-                    captured_page = _page_from_html(
-                        html,
-                        url=page.url,
-                        link_status=lambda href, checked=statuses: checked.get(href, 599),
-                    )
-                    known_issues = {
-                        (issue.rule, issue.selector)
-                        for issue in captured_page.accessibility_issues
-                    }
-                    severity_map = {
-                        "minor": Severity.LOW,
-                        "moderate": Severity.MEDIUM,
-                        "serious": Severity.HIGH,
-                        "critical": Severity.HIGH,
-                    }
-                    for violation in axe_result.get("violations", []):
-                        for node in violation.get("nodes", []):
-                            targets = node.get("target", [])
-                            selector = str(targets[0]) if targets else "document"
-                            issue_key = (f"axe:{violation['id']}", selector)
-                            canonical_key = (violation["id"], selector)
-                            if issue_key in known_issues or canonical_key in known_issues:
-                                continue
-                            captured_page.accessibility_issues.append(
-                                AccessibilityIssue(
-                                    rule=issue_key[0],
-                                    description=violation.get(
-                                        "help", "Automated accessibility check failed."
-                                    ),
-                                    selector=selector,
-                                    severity=severity_map.get(
-                                        violation.get("impact"), Severity.MEDIUM
-                                    ),
-                                )
+                        except Exception as navigation_error:
+                            _browser_journal(
+                                "browser_navigation_failed",
+                                run_id=run_id,
+                                target_id=target.target_id,
+                                browser_session_id=session_id,
+                                target_url=page_url,
+                                error_category=type(navigation_error).__name__,
+                                summary=str(navigation_error),
                             )
-                    slug = re.sub(r"[^a-z0-9]+", "-", step.label.lower()).strip("-")
-                    screenshot_prefix = (
-                        f"baselines/{target.target_id}/{run_id}/screenshots"
-                        if run_id.startswith("baseline")
-                        else f"screenshots/{target.target_id}/{run_id}"
-                    )
-                    page_screenshot_key = f"{screenshot_prefix}/{index + 1}-{slug}.png"
-                    bucket = os.getenv("EVIDENCE_BUCKET") or os.getenv("CIVIC_CANARY_S3_BUCKET")
-                    if not bucket:
-                        raise RuntimeError(
-                            "CIVIC_CANARY_S3_BUCKET is required for browser evidence"
+                            raise
+                        final_url = page.url
+                        title = page.title()
+                        status = response.status if response is not None else None
+                        _browser_journal(
+                            "browser_navigation_completed",
+                            run_id=run_id,
+                            target_id=target.target_id,
+                            browser_session_id=session_id,
+                            status=status,
+                            target_url=page_url,
+                            page_url_before=current_url,
+                            page_url_after=final_url,
+                            final_url=final_url,
+                            title=title,
+                            page_reused=page_reused,
+                            context_count=len(browser.contexts),
+                            page_count_after=len(context.pages),
                         )
-                    screenshot_bytes = page.screenshot(full_page=True)
-                    boto3.client("s3", region_name=self.region).put_object(
-                        Bucket=bucket,
-                        Key=page_screenshot_key,
-                        Body=screenshot_bytes,
-                        ContentType="image/png",
-                    )
-                    captured_page.screenshot_key = page_screenshot_key
-                    screenshot_key = screenshot_key or page_screenshot_key
-                    pages.append(captured_page)
-                    log_event(
-                        "browser_evidence_captured",
+                        validate_navigation_url(final_url, target.allowed_hosts)
+                        if response is not None and response.status >= 400:
+                            raise RuntimeError(
+                                f"page returned HTTP {response.status}: {page_url}"
+                            )
+                        axe_result: dict = {"violations": []}
+                        if axe_source:
+                            page.add_script_tag(content=axe_source)
+                            axe_result = page.evaluate(
+                                "async () => await window.axe.run(document, "
+                                "{resultTypes: ['violations']})"
+                            )
+                        html = page.content()
+                        if not html or len(html) < 32:
+                            raise RuntimeError(
+                                f"AgentCore page content was empty after navigation to {final_url}"
+                            )
+                        soup = BeautifulSoup(html, "html.parser")
+                        statuses: dict[str, int] = {}
+                        for anchor in soup.select("a[href]")[:20]:
+                            href = anchor.get("href", "")
+                            linked = urljoin(page.url, href)
+                            if not href or href.startswith(("#", "mailto:", "tel:")):
+                                statuses[href] = 200
+                            elif not request_is_allowed("HEAD", linked, target.allowed_hosts):
+                                statuses[href] = 403
+                            else:
+                                try:
+                                    validate_public_url(linked.split("#")[0])
+                                    linked_response = context.request.head(
+                                        linked, max_redirects=0, timeout=1500
+                                    )
+                                    if linked_response.status in {405, 501}:
+                                        linked_response = context.request.get(
+                                            linked,
+                                            headers={"Range": "bytes=0-0"},
+                                            max_redirects=0,
+                                            timeout=1500,
+                                        )
+                                    statuses[href] = linked_response.status
+                                except Exception:
+                                    statuses[href] = 599
+                        captured_page = _page_from_html(
+                            html,
+                            url=page.url,
+                            link_status=lambda href, checked=statuses: checked.get(href, 599),
+                        )
+                        known_issues = {
+                            (issue.rule, issue.selector)
+                            for issue in captured_page.accessibility_issues
+                        }
+                        severity_map = {
+                            "minor": Severity.LOW,
+                            "moderate": Severity.MEDIUM,
+                            "serious": Severity.HIGH,
+                            "critical": Severity.HIGH,
+                        }
+                        for violation in axe_result.get("violations", []):
+                            for node in violation.get("nodes", []):
+                                targets = node.get("target", [])
+                                selector = str(targets[0]) if targets else "document"
+                                issue_key = (f"axe:{violation['id']}", selector)
+                                canonical_key = (violation["id"], selector)
+                                if issue_key in known_issues or canonical_key in known_issues:
+                                    continue
+                                captured_page.accessibility_issues.append(
+                                    AccessibilityIssue(
+                                        rule=issue_key[0],
+                                        description=violation.get(
+                                            "help", "Automated accessibility check failed."
+                                        ),
+                                        selector=selector,
+                                        severity=severity_map.get(
+                                            violation.get("impact"), Severity.MEDIUM
+                                        ),
+                                    )
+                                )
+                        slug = re.sub(r"[^a-z0-9]+", "-", step.label.lower()).strip("-")
+                        screenshot_prefix = (
+                            f"baselines/{target.target_id}/{run_id}/screenshots"
+                            if run_id.startswith("baseline")
+                            else f"screenshots/{target.target_id}/{run_id}"
+                        )
+                        page_screenshot_key = f"{screenshot_prefix}/{index + 1}-{slug}.png"
+                        bucket = os.getenv("EVIDENCE_BUCKET") or os.getenv(
+                            "CIVIC_CANARY_S3_BUCKET"
+                        )
+                        if not bucket:
+                            raise RuntimeError(
+                                "CIVIC_CANARY_S3_BUCKET is required for browser evidence"
+                            )
+                        screenshot_bytes = page.screenshot(full_page=True)
+                        boto3.client("s3", region_name=self.region).put_object(
+                            Bucket=bucket,
+                            Key=page_screenshot_key,
+                            Body=screenshot_bytes,
+                            ContentType="image/png",
+                        )
+                        captured_page.screenshot_key = page_screenshot_key
+                        screenshot_key = screenshot_key or page_screenshot_key
+                        pages.append(captured_page)
+                        _browser_journal(
+                            "browser_evidence_captured",
+                            run_id=run_id,
+                            target_id=target.target_id,
+                            browser_session_id=session_id,
+                            step=step.label,
+                            final_url=final_url,
+                            title=title,
+                            html_bytes=len(html),
+                            screenshot_key=page_screenshot_key,
+                            headings=len(captured_page.headings),
+                            page_reused=page_reused,
+                            page_count_after=len(context.pages),
+                            summary="Evidence capture complete; replay page should be recorded",
+                        )
+                    if not pages:
+                        raise RuntimeError(
+                            "AgentCore capture finished with zero pages; navigation did not produce evidence"
+                        )
+                finally:
+                    # Keep the instrumented page open while CDP is connected so replay
+                    # can upload DOM/navigation batches (short sessions → Pages 0).
+                    flush_seconds = float(os.getenv("AGENTCORE_REPLAY_FLUSH_SECONDS", "5"))
+                    shutdown_started = time.monotonic()
+                    _browser_journal(
+                        "browser_session_closing",
                         run_id=run_id,
                         target_id=target.target_id,
                         browser_session_id=session_id,
-                        step=step.label,
-                        final_url=final_url,
-                        title=title,
-                        html_bytes=len(html),
-                        screenshot_key=page_screenshot_key,
-                        headings=len(captured_page.headings),
+                        pages_captured=len(pages),
+                        page_reused=page_reused,
+                        flush_seconds=flush_seconds,
+                        context_count=len(browser.contexts) if browser is not None else 0,
+                        page_count=len(context.pages) if context is not None else 0,
+                        summary="Waiting for Session Replay flush before CDP disconnect",
                     )
-                if not pages:
-                    raise RuntimeError(
-                        "AgentCore capture finished with zero pages; navigation did not produce evidence"
+                    if flush_seconds > 0:
+                        time.sleep(flush_seconds)
+                    _browser_journal(
+                        "browser_replay_flush_waited",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        flush_seconds=flush_seconds,
+                        elapsed_ms=int((time.monotonic() - shutdown_started) * 1000),
                     )
-            finally:
-                log_event(
-                    "browser_session_closing",
-                    run_id=run_id,
-                    target_id=target.target_id,
-                    browser_session_id=session_id,
-                    pages_captured=len(pages),
-                )
-                try:
-                    if page is not None:
-                        page.close()
-                except Exception:
-                    pass
-                try:
-                    if browser is not None:
-                        browser.close()
-                except Exception:
-                    pass
-                log_event(
-                    "browser_session_closed",
-                    run_id=run_id,
-                    target_id=target.target_id,
-                    browser_session_id=session_id,
-                    pages_captured=len(pages),
-                )
+                    # Do not page.close() the default instrumented tab before session stop.
+                    try:
+                        if browser is not None:
+                            browser.close()
+                    except Exception:
+                        pass
+                    _browser_journal(
+                        "browser_cdp_disconnected",
+                        run_id=run_id,
+                        target_id=target.target_id,
+                        browser_session_id=session_id,
+                        pages_captured=len(pages),
+                        page_reused=page_reused,
+                        shutdown_ms=int((time.monotonic() - shutdown_started) * 1000),
+                    )
+
+            settle_seconds = float(os.getenv("AGENTCORE_REPLAY_SETTLE_SECONDS", "5"))
+            settle_started = time.monotonic()
+            _browser_journal(
+                "browser_session_settle_before_stop",
+                run_id=run_id,
+                target_id=target.target_id,
+                browser_session_id=session_id,
+                settle_seconds=settle_seconds,
+                pages_captured=len(pages),
+                summary="AgentCore session still open; allowing final recording upload before StopBrowserSession",
+            )
+            if settle_seconds > 0:
+                time.sleep(settle_seconds)
+            _browser_journal(
+                "browser_session_closed",
+                run_id=run_id,
+                target_id=target.target_id,
+                browser_session_id=session_id,
+                pages_captured=len(pages),
+                settle_ms=int((time.monotonic() - settle_started) * 1000),
+                summary="Exiting browser_session context; StopBrowserSession will finalize recording",
+            )
+
         return PortalSnapshot(
             target_id=target.target_id,
             run_id=run_id,
