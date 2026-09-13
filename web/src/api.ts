@@ -36,6 +36,36 @@ export type Run = {
   reasoning_source?: string
   review_memo?: { run_id: string; engine: string; model_id: string; packet: { summary: string } }
   notification_status?: string
+  monitoring_brief?: MonitoringBrief | null
+}
+
+export type BriefChangeItem = {
+  category: string
+  title: string
+  severity: 'Low' | 'Medium' | 'High'
+  previous: string
+  current: string
+  impact: string
+  recommended_action: string
+}
+
+export type MonitoringBrief = {
+  run_id: string
+  target_id: string
+  website_name: string
+  scanned_at: string
+  status: 'BASELINE_ESTABLISHED' | 'NO_MATERIAL_CHANGE' | 'REVIEW_RECOMMENDED' | 'IMPORTANT_CHANGE'
+  status_label: string
+  executive_summary: string
+  sections_reviewed: string[]
+  changes: BriefChangeItem[]
+  overall_severity: 'Low' | 'Medium' | 'High' | null
+  why_it_matters: string
+  recommended_action: string
+  source_url: string | null
+  evidence_keys: string[]
+  screenshot_key: string | null
+  source: string
 }
 
 export type Finding = {
@@ -134,6 +164,8 @@ export const api = {
   deleteWebsite: (id: string, token: string) => request<{ ok: boolean; target_id: string }>(`/api/targets/${id}`, {
     method: 'DELETE', headers: protectedHeaders(token),
   }),
+  latestBrief: (id: string, token = '') =>
+    request<MonitoringBrief>(`/api/targets/${id}/monitoring-brief`, { headers: protectedHeaders(token) }),
   confirm: (id: string, sections: string[], token: string) => request<Target>(`/api/targets/${id}/confirm`, {
     method: 'POST', headers: protectedHeaders(token), body: JSON.stringify({ monitored_sections: sections }),
   }),

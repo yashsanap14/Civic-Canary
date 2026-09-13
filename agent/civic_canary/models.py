@@ -338,6 +338,68 @@ class NodeTiming(BaseModel):
     ]
 
 
+class BriefStatus(StrEnum):
+    BASELINE_ESTABLISHED = "BASELINE_ESTABLISHED"
+
+    NO_MATERIAL_CHANGE = "NO_MATERIAL_CHANGE"
+
+    REVIEW_RECOMMENDED = "REVIEW_RECOMMENDED"
+
+    IMPORTANT_CHANGE = "IMPORTANT_CHANGE"
+
+
+class BriefChangeItem(BaseModel):
+    category: str
+
+    title: str
+
+    severity: Literal["Low", "Medium", "High"]
+
+    previous: str = ""
+
+    current: str = ""
+
+    impact: str = ""
+
+    recommended_action: str = ""
+
+
+class MonitoringBrief(BaseModel):
+    """Human-readable monitoring summary for a completed scan."""
+
+    run_id: str
+
+    target_id: str
+
+    website_name: str
+
+    scanned_at: datetime = Field(default_factory=utc_now)
+
+    status: BriefStatus
+
+    status_label: str
+
+    executive_summary: str
+
+    sections_reviewed: list[str] = Field(default_factory=list)
+
+    changes: list[BriefChangeItem] = Field(default_factory=list)
+
+    overall_severity: Literal["Low", "Medium", "High"] | None = None
+
+    why_it_matters: str = ""
+
+    recommended_action: str = ""
+
+    source_url: str | None = None
+
+    evidence_keys: list[str] = Field(default_factory=list)
+
+    screenshot_key: str | None = None
+
+    source: str = "deterministic"
+
+
 class Run(BaseModel):
     run_id: str
 
@@ -364,6 +426,8 @@ class Run(BaseModel):
     reasoning_source: str = "deterministic-fixture"
 
     notification_status: str = "NOT_REQUIRED"
+
+    monitoring_brief: MonitoringBrief | None = None
 
 
 class ReviewDecision(BaseModel):

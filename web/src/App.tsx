@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react'
 
-import { api, type Finding, type Run, type Target } from './api'
+import { api, type Finding, type MonitoringBrief, type Run, type Target } from './api'
 import './styles.css'
 
 const SESSION_KEYS = {
@@ -59,6 +59,25 @@ function isDemoTarget(target: Target | null | undefined) {
 function setupLabel(status: Target['setup_status']) {
   if (!status) return 'Unknown'
   return status.replaceAll('_', ' ')
+}
+
+function briefFromRuns(runs: Run[], targetId: string | undefined): MonitoringBrief | null {
+  if (!targetId) return null
+  const match = runs.find(
+    (run) => run.target_id === targetId && run.status === 'SUCCEEDED' && run.monitoring_brief,
+  )
+  return match?.monitoring_brief ?? null
+}
+
+function formatBriefTime(value: string | null | undefined) {
+  if (!value) return 'Not completed'
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(value))
 }
 
 export default function App() {
@@ -167,6 +186,8 @@ export default function App() {
     ?? liveTargets[0]
     ?? null
   const visibleFindings = findings.filter((finding) => finding.target_id === target?.target_id)
+  const targetRuns = runs.filter((run) => run.target_id === target?.target_id)
+  const latestBrief = briefFromRuns(runs, target?.target_id)
   const openFindings = useMemo(
     () => findings.filter((finding) => finding.status === 'OPEN' && finding.target_id === target?.target_id),
     [findings, target?.target_id],
@@ -447,6 +468,7 @@ export default function App() {
             <div className="setup-status">
               <strong>Setup: {setupLabel(selectedLive.setup_status)}</strong>
               <p>Run: {selectedLive.setup_run_id || 'Not started'}</p>
+              <p className="feature-hint">You can delete this website at any time, including while inspection is running.</p>
               {selectedLive.setup_status === 'AWAITING_CONFIRMATION' && <>
                 <p>The agent found these relevant headings. Accept them or edit one section per line.</p>
                 <textarea
@@ -474,20 +496,88 @@ export default function App() {
           )}
           {selectedLive?.setup_status === 'ACTIVE' && (
             <p className="feature-hint">
-              Next scan: {formatTime(selectedLive.next_scan_at ?? null)}. First scan captures the live baseline; later scans look for meaningful drift.
+              Next scan: {formatTime(selectedLive.next_scan_at ?? null)}. First scan captures the live baseline; later scans look for meaningful drift. You can delete this website at any time.
             </p>
           )}
         </section>
 
         <section className="metrics" aria-label="Summary">
           <article><small>Open decisions</small><strong>{openFindings.length}</strong><span>Need a human</span></article>
-          <article><small>Latest run</small><strong>{runs.find((row) => row.target_id === target?.target_id)?.status ?? '—'}</strong><span>{formatTime(runs.find((row) => row.target_id === target?.target_id)?.finished_at ?? null)}</span></article>
+          <article><small>Latest run</small><strong>{targetRuns[0]?.status ?? '—'}</strong><span>{formatTime(targetRuns[0]?.finished_at ?? null)}</span></article>
           <article>
             <small>Scan frequency</small>
             <strong>{target ? `${target.scan_frequency_minutes ?? '—'} min` : '—'}</strong>
             <span>Public website</span>
           </article>
         </section>
+
+        {target && (
+          <section className="monitoring-brief" aria-label="Latest monitoring brief">
+            <div className="section-heading">
+              <div>
+                <p className="kicker">Monitoring summary</p>
+                <h2>Latest Monitoring Brief</h2>
+              </div>
+            </div>
+            {latestBrief ? (
+              <article className={`brief-card status-${latestBrief.status.toLowerCase()}`}>
+                <header className="brief-header">
+                  <div>
+                    <strong>{latestBrief.website_name}</strong>
+                    <small>Scanned: {formatBriefTime(latestBrief.scanned_at)}</small>
+                  </div>
+                  <span className={`brief-status status-${latestBrief.status.toLowerCase()}`}>
+                    {latestBrief.status_label}
+                  </span>
+                </header>
+                <p className="brief-summary">{latestBrief.executive_summary}</p>
+                {latestBrief.sections_reviewed.length > 0 && (
+                  <div className="brief-sections">
+                    <h3>Sections reviewed</h3>
+                    <ul>
+                      {latestBrief.sections_reviewed.map((section) => (
+                        <li key={section}>{section}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {latestBrief.changes.length > 0 ? (
+                  <div className="brief-changes">
+                    <h3>Detected changes</h3>
+                    {latestBrief.changes.map((change) => (
+                      <article key={`${change.category}-${change.title}`} className="brief-change-item">
+                        <div className="brief-change-title">
+                          <strong>{change.title}</strong>
+                          <span className={`severity severity-${change.severity.toLowerCase()}`}>{change.severity}</span>
+                        </div>
+                        <p><small>Category</small> {change.category}</p>
+                        <div className="before-after">
+                          <div><h4>Previous</h4><p>{change.previous}</p></div>
+                          <div><h4>Current</h4><p>{change.current}</p></div>
+                        </div>
+                        <p><small>Impact</small> {change.impact}</p>
+                        <p><small>Recommended action</small> {change.recommended_action}</p>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="brief-action"><strong>Recommended action:</strong> {latestBrief.recommended_action}</p>
+                )}
+                {latestBrief.source_url && (
+                  <a className="portal-link" href={latestBrief.source_url} target="_blank" rel="noreferrer">
+                    Open source page <ArrowRight aria-hidden="true" />
+                  </a>
+                )}
+              </article>
+            ) : (
+              <div className="empty-state brief-empty">
+                <FileCheck2 aria-hidden="true" />
+                <h3>No brief yet</h3>
+                <p>After the first successful scan, Civic Canary will show a concise monitoring summary here.</p>
+              </div>
+            )}
+          </section>
+        )}
 
         <section className="work-grid">
           <div className="primary-column">
@@ -520,13 +610,19 @@ export default function App() {
             </div>
 
             <div className="section-heading runs-heading">
-              <div><p className="kicker">Audit trail</p><h2>Recent runs</h2></div>
+              <div><p className="kicker">Monitoring history</p><h2>Recent runs</h2></div>
             </div>
             <div className="run-list">
-              {target && runs.filter((run) => run.target_id === target.target_id).map((run) => (
+              {target && targetRuns.map((run) => (
                 <button key={run.run_id} className="run-row" onClick={() => setSelectedRun(run)}>
                   <span className="run-icon"><Clock3 aria-hidden="true" /></span>
-                  <span><strong>{run.trigger_type.toLowerCase()} scan</strong><small>{formatTime(run.finished_at)}</small></span>
+                  <span>
+                    <strong>{run.trigger_type.toLowerCase()} scan</strong>
+                    <small>
+                      {formatTime(run.finished_at)}
+                      {run.monitoring_brief ? ` · ${run.monitoring_brief.status_label}` : ''}
+                    </small>
+                  </span>
                   <span className={`run-status status-${run.status.toLowerCase()}`}>{run.status}</span>
                 </button>
               ))}
@@ -610,8 +706,9 @@ export default function App() {
             <p className="kicker">Remove website</p>
             <h2 id="delete-live-title">Delete “{pendingDelete.name}”?</h2>
             <p>
-              This removes the website from monitoring, cancels its schedule, and deletes related findings,
-              runs, and evidence for this target only. This cannot be undone.
+              This removes the website from monitoring at any time—including during inspection—
+              cancels in-flight scans, and deletes related findings, runs, and evidence for this
+              target only. This cannot be undone.
             </p>
             <p className="feature-hint">{pendingDelete.start_url}</p>
             <div className="modal-actions">
@@ -676,7 +773,17 @@ export default function App() {
             <button className="close-button" onClick={() => setSelectedRun(null)} aria-label="Close run"><X aria-hidden="true" /></button>
             <p className="kicker">Run detail</p>
             <h2 id="run-title">{selectedRun.run_id}</h2>
-            <p>{selectedRun.summary}</p>
+            {selectedRun.monitoring_brief ? (
+              <div className="run-brief">
+                <p className={`brief-status status-${selectedRun.monitoring_brief.status.toLowerCase()}`}>
+                  {selectedRun.monitoring_brief.status_label}
+                </p>
+                <p>{selectedRun.monitoring_brief.executive_summary}</p>
+                <p><strong>Recommended action:</strong> {selectedRun.monitoring_brief.recommended_action}</p>
+              </div>
+            ) : (
+              <p>{selectedRun.summary}</p>
+            )}
             <p>Reasoning: {selectedRun.reasoning_source ?? 'Fixture'} · Notification: {selectedRun.notification_status ?? 'Not required'}</p>
             {selectedRun.review_memo && <><p>Model: {selectedRun.review_memo.model_id}</p><p>{selectedRun.review_memo.packet?.summary}</p></>}
             <div className="timeline">

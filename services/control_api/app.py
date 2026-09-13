@@ -25,6 +25,7 @@ from agent.civic_canary.models import (
     PortalTarget,
     ReviewDecision,
     RunRequest,
+    RunStatus,
     TriggerType,
 )
 from agent.civic_canary.scenarios import seed_targets
@@ -150,19 +151,19 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             for run in app.state.store.list_runs()
             if run.target_id == target_id and run.status in {"QUEUED", "RUNNING"}
         ]
-        if any(run.status == "RUNNING" for run in active_runs):
-            raise HTTPException(
-                409,
-                "A scan is currently running for this website. Try again after it finishes.",
-            )
-
-        # Drop queued jobs for this target before removing the site row so workers
-        # cannot pick up orphaned work after deletion.
+        # Allow delete at any time, including during extraction/inspection. Cancel in-flight
+        # work first so the worker cannot resurrect orphaned jobs after the site is gone.
         for run in active_runs:
             try:
                 app.state.store.delete_json(f"jobs/{run.run_id}.json")
             except Exception:
                 pass
+            if run.status in {"QUEUED", "RUNNING"}:
+                run.status = RunStatus.FAILED
+                run.finished_at = datetime.now(UTC)
+                run.error_category = "Cancelled"
+                run.summary = "Cancelled because the website was deleted."
+                app.state.store.put_run(run)
 
         try:
             summary = app.state.store.delete_target(target_id)
@@ -187,6 +188,42 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
             **{key: value for key, value in summary.items() if isinstance(value, int)},
         )
         return {"ok": True, "target_id": target_id, "deleted": summary}
+
+    @app.get("/api/targets/{target_id}/monitoring-brief", dependencies=[Depends(require_read)])
+    def latest_monitoring_brief(target_id: str):
+        target = get_target(target_id)
+        runs = [
+            run
+            for run in app.state.store.recent_runs(50)
+            if run.target_id == target_id
+            and run.status == "SUCCEEDED"
+            and run.monitoring_brief is not None
+        ]
+        if not runs:
+            # Backfill-friendly: prefer newest succeeded run even if brief was not stored yet.
+            fallback = [
+                run
+                for run in app.state.store.recent_runs(50)
+                if run.target_id == target_id and run.status == "SUCCEEDED"
+            ]
+            if not fallback:
+                raise HTTPException(404, "No monitoring brief is available yet")
+            newest = fallback[0]
+            from services.brief import build_monitoring_brief
+
+            findings = [
+                finding
+                for finding in app.state.store.list_findings()
+                if finding.run_id == newest.run_id
+            ]
+            brief = build_monitoring_brief(
+                run=newest,
+                target=target,
+                findings=findings,
+                baseline_established=newest.summary.startswith("Baseline captured"),
+            )
+            return brief
+        return runs[0].monitoring_brief
 
     @app.post("/api/targets/{target_id}/inspect", dependencies=[Depends(require_token)])
     async def inspect_website(target_id: str):

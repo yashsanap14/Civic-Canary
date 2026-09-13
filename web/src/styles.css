@@ -281,6 +281,106 @@ button svg, a svg { width: 17px; height: 17px; }
   font-size: .85rem;
 }
 .confirm-modal .modal-actions { margin-top: 1rem; }
+.monitoring-brief {
+  margin: 2rem 0 0;
+  display: grid;
+  gap: 1rem;
+}
+.brief-card {
+  background: #fff;
+  border: 1px solid #d7e0dc;
+  border-radius: 20px;
+  padding: 1.4rem 1.5rem 1.5rem;
+  box-shadow: 0 14px 40px rgba(36, 61, 50, .06);
+  border-top: 3px solid #2f7a5b;
+  display: grid;
+  gap: 1rem;
+}
+.brief-card.status-important_change { border-top-color: #9b3b2e; }
+.brief-card.status-review_recommended { border-top-color: #b7791f; }
+.brief-card.status-baseline_established { border-top-color: #3b6ea5; }
+.brief-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+.brief-header strong {
+  display: block;
+  color: #17352b;
+  font-size: 1.2rem;
+}
+.brief-header small {
+  color: #6a7b73;
+}
+.brief-status {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: .35rem .75rem;
+  font-size: .78rem;
+  font-weight: 700;
+  text-transform: none;
+  background: #e7eee9;
+  color: #355447;
+}
+.brief-status.status-no_material_change { background: #d9efe4; color: #1f6a4a; }
+.brief-status.status-baseline_established { background: #dde8f5; color: #2a4f7a; }
+.brief-status.status-review_recommended { background: #f6ead8; color: #8a5a1d; }
+.brief-status.status-important_change { background: #f3ddd8; color: #8a3226; }
+.brief-summary {
+  margin: 0;
+  color: #31463d;
+  line-height: 1.6;
+}
+.brief-sections h3,
+.brief-changes h3 {
+  margin: 0 0 .55rem;
+  font-size: 1rem;
+  color: #264839;
+}
+.brief-sections ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #42584e;
+  display: grid;
+  gap: .25rem;
+}
+.brief-changes {
+  display: grid;
+  gap: .9rem;
+}
+.brief-change-item {
+  border: 1px solid #d7e0dc;
+  border-radius: 14px;
+  padding: 1rem;
+  background: #f7faf8;
+  display: grid;
+  gap: .65rem;
+}
+.brief-change-title {
+  display: flex;
+  justify-content: space-between;
+  gap: .75rem;
+  align-items: flex-start;
+}
+.brief-change-item small {
+  display: block;
+  color: #6a7b73;
+  font-weight: 700;
+  margin-bottom: .2rem;
+}
+.brief-action {
+  margin: 0;
+  color: #31463d;
+}
+.brief-empty {
+  background: #fff;
+}
+.run-brief {
+  display: grid;
+  gap: .75rem;
+  margin-bottom: 1rem;
+}
 .live-panel { border-top: 3px solid #2f7a5b; }
 .demo-scenario { border-top: 3px solid #d36f31; }
 .demo-scenario .version-switch { margin-top: .15rem; }

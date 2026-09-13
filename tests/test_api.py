@@ -218,7 +218,7 @@ def test_delete_live_website_removes_target_scoped_records(monkeypatch) -> None:
     assert store.get_finding(keep_finding.finding_id) is not None
 
 
-def test_delete_rejects_running_scan(monkeypatch) -> None:
+def test_delete_allows_running_scan_cancellation(monkeypatch) -> None:
     from agent.civic_canary.models import JourneyStep, PortalTarget, Run, RunStatus, TriggerType
 
     api, store = client(monkeypatch)
@@ -230,7 +230,7 @@ def test_delete_rejects_running_scan(monkeypatch) -> None:
         start_url="https://example.org/busy",
         allowed_hosts=["example.org"],
         journey_steps=[JourneyStep(path="/", label="Home")],
-        setup_status="ACTIVE",
+        setup_status="PENDING",
     )
     store.put_target(live)
     store.put_run(
@@ -241,6 +241,76 @@ def test_delete_rejects_running_scan(monkeypatch) -> None:
             status=RunStatus.RUNNING,
         )
     )
+    store.put_json("jobs/run-busy.json", {"run_id": "run-busy"})
     response = api.delete(f"/api/targets/{live.target_id}", headers=headers)
-    assert response.status_code == 409
-    assert store.get_target(live.target_id) is not None
+    assert response.status_code == 200
+    assert store.get_target(live.target_id) is None
+    assert store.get_json("jobs/run-busy.json") is None
+
+
+def test_monitoring_brief_baseline_and_no_change(monkeypatch) -> None:
+    from agent.civic_canary.models import (
+        JourneyStep,
+        PortalSnapshot,
+        PortalTarget,
+        Run,
+        RunStatus,
+        TriggerType,
+    )
+    from services.brief import build_monitoring_brief
+
+    target = PortalTarget(
+        target_id="site-brief01",
+        kind="live",
+        name="Public benefits portal",
+        start_url="https://example.org/benefits",
+        allowed_hosts=["example.org"],
+        journey_steps=[JourneyStep(path="/", label="Home")],
+        monitored_sections=["Eligibility requirements", "Application process"],
+        setup_status="ACTIVE",
+    )
+    run = Run(
+        run_id="run-brief-1",
+        target_id=target.target_id,
+        trigger_type=TriggerType.MANUAL,
+        status=RunStatus.SUCCEEDED,
+        finished_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        reasoning_source="strands-bedrock",
+        review_memo={
+            "packet": {
+                "summary": "Civic Canary reviewed the monitored sections and found no meaningful changes.",
+                "recommended_sections": ["Eligibility requirements"],
+            }
+        },
+    )
+    snapshot = PortalSnapshot(
+        target_id=target.target_id,
+        run_id=run.run_id,
+        version="live",
+        pages=[],
+        content_hash="abc",
+        screenshot_key="screenshots/site-brief01/run-brief-1/1-home.png",
+    )
+    baseline = build_monitoring_brief(
+        run=run, target=target, findings=[], snapshot=snapshot, baseline_established=True
+    )
+    assert baseline.status_label == "Baseline established"
+    assert "baseline" in baseline.executive_summary.lower()
+    assert baseline.recommended_action.startswith("Confirm")
+
+    steady = build_monitoring_brief(
+        run=run, target=target, findings=[], snapshot=snapshot, baseline_established=False
+    )
+    assert steady.status_label == "No material change"
+    assert steady.recommended_action.startswith("No action required")
+    assert "Eligibility requirements" in steady.sections_reviewed
+    assert steady.screenshot_key.endswith("1-home.png")
+
+    api_client, store = client(monkeypatch)
+    store.put_target(target)
+    run.monitoring_brief = steady
+    store.put_run(run)
+    headers = {"X-Review-Token": "review-demo"}
+    response = api_client.get(f"/api/targets/{target.target_id}/monitoring-brief", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["status_label"] == "No material change"

@@ -12,6 +12,7 @@ import boto3
 from agent.civic_canary.browser import BrowserAdapter, create_browser_adapter
 from agent.civic_canary.engine import CivicCanaryEngine, RunExecutionError
 from agent.civic_canary.models import Finding, PortalTarget, Run, RunStatus, TriggerType
+from services.brief import build_monitoring_brief
 from services.observability import log_event
 from services.storage import Store
 
@@ -119,6 +120,13 @@ class ScanService:
                         run.summary = "Baseline captured. Confirm the sections to monitor."
                         run.finished_at = datetime.now(UTC)
                         run.notification_status = "NOT_REQUIRED"
+                        run.monitoring_brief = build_monitoring_brief(
+                            run=run,
+                            target=target,
+                            findings=[],
+                            snapshot=snapshot,
+                            baseline_established=True,
+                        )
                         self.store.put_snapshot(snapshot)
                         self.store.put_run(run)
                         log_event(
@@ -158,6 +166,13 @@ class ScanService:
                     run.summary = "Baseline captured. Confirm the sections to monitor."
                     run.finished_at = datetime.now(UTC)
                     run.reasoning_source = "http-baseline"
+                    run.monitoring_brief = build_monitoring_brief(
+                        run=run,
+                        target=target,
+                        findings=[],
+                        snapshot=snapshot,
+                        baseline_established=True,
+                    )
                     self.store.put_run(run)
                     return run, []
                 if baseline is None:
@@ -216,6 +231,13 @@ class ScanService:
                 )
                 self.store.put_target(latest)
                 target = latest
+            run.monitoring_brief = build_monitoring_brief(
+                run=run,
+                target=target,
+                findings=persisted or findings,
+                snapshot=snapshot,
+                baseline_established=False,
+            )
             self.store.put_run(run)
             log_event(
                 "scan_completed",
@@ -225,6 +247,7 @@ class ScanService:
                 new_findings=len(persisted),
                 status=run.status,
                 setup_status=target.setup_status,
+                brief_status=run.monitoring_brief.status if run.monitoring_brief else None,
             )
             return run, persisted
         except Exception as exc:
