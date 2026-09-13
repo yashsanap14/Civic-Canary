@@ -30,7 +30,9 @@ def enqueue_scan(store, target, trigger=TriggerType.MANUAL, run_id=None):
         existing = store.get_run(run.run_id)
         if existing is None or existing.target_id != target.target_id:
             raise ValueError("Run ID is already reserved for another website")
-        if existing.status == RunStatus.QUEUED:
+        # QUEUED/RUNNING without jobs/*.json is invisible to the timer worker and
+        # leaves setup stuck on PENDING forever. Always re-materialize the job object.
+        if existing.status in {RunStatus.QUEUED, RunStatus.RUNNING}:
             store.put_json(
                 f"jobs/{run.run_id}.json", {"run_id": run.run_id, "target_id": target.target_id}
             )
@@ -39,6 +41,7 @@ def enqueue_scan(store, target, trigger=TriggerType.MANUAL, run_id=None):
                 run_id=run.run_id,
                 target_id=target.target_id,
                 trigger_type=trigger.value,
+                status=existing.status,
             )
         return existing
     store.put_json(f"jobs/{run.run_id}.json", {"run_id": run.run_id, "target_id": target.target_id})

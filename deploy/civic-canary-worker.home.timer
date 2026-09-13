@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Civic Canary worker about once per minute
+
+[Timer]
+OnBootSec=15s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=civic-canary-worker.service
+
+[Install]
+WantedBy=timers.target

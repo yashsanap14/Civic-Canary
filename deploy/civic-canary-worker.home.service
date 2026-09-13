@@ -1,0 +1,18 @@
+[Unit]
+Description=Civic Canary Background Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Civic-Canary
+EnvironmentFile=/home/ubuntu/Civic-Canary/.env
+Environment=PYTHONUNBUFFERED=1
+# flock prevents overlapping timer ticks while a long AgentCore scan runs
+ExecStart=/usr/bin/flock -n /home/ubuntu/Civic-Canary/.worker.lock /home/ubuntu/Civic-Canary/.venv/bin/python -m scripts.monitor_due
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

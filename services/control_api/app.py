@@ -236,8 +236,25 @@ def create_app(store: Store | None = None, verifier: ReviewTokenVerifier | None 
         if target.setup_run_id:
             existing = app.state.store.get_run(target.setup_run_id)
             if existing and existing.status == "RUNNING":
-                return {"run": existing}
-            if existing and existing.status == "QUEUED":
+                job = app.state.store.get_json(f"jobs/{existing.run_id}.json")
+                if job is not None:
+                    # Worker still owns this run; do not start a duplicate.
+                    return {"run": existing}
+                # Orphan RUNNING (no jobs/*.json): timer never sees it → PENDING forever.
+                existing.status = RunStatus.FAILED
+                existing.finished_at = datetime.now(UTC)
+                existing.error_category = "InterruptedWorker"
+                existing.summary = (
+                    "Previous inspection lost its worker job; starting a fresh scan."
+                )
+                app.state.store.put_run(existing)
+                log_event(
+                    "setup_orphan_running_recovered",
+                    run_id=existing.run_id,
+                    target_id=target_id,
+                    summary=existing.summary,
+                )
+            elif existing and existing.status == "QUEUED":
                 # Repair a missing jobs/*.json object so the worker can pick it up.
                 run = enqueue_scan(
                     app.state.store, target, TriggerType.MANUAL, existing.run_id
