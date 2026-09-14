@@ -7,6 +7,21 @@ for a human reviewer.
 
 The repository contains a working local MVP and an AWS deployment hosted on Amazon EC2.
 
+**License:** [MIT](LICENSE) · Copyright (c) 2026 Rudra Bedekar
+
+## Deployed AWS architecture
+
+The diagram below shows **only the architecture actually deployed** for Civic Canary
+(CloudFront → Nginx/React/FastAPI on EC2 → Strands → Bedrock + AgentCore Browser →
+DynamoDB/S3, with human approve/reject). Optional unused paths such as Lambda, API Gateway,
+EventBridge, and AgentCore Runtime are intentionally omitted.
+
+![Civic Canary deployed AWS architecture](docs/civic-canary-architecture.png)
+
+**Flow:** Reviewer → CloudFront → EC2 (UI/API/worker) → Strands → Bedrock / AgentCore Browser →
+public websites → S3 evidence + DynamoDB findings → human approve/reject → Reviews + approved
+artifact in S3.
+
 ## Deployed AWS workflow
 
 We built and deployed **Civic Canary**, an AWS-based monitoring system that detects meaningful
@@ -74,11 +89,11 @@ Civic Canary does not:
 
 ## Deployed architecture and monitoring upgrade
 
-The deployed foundation reported by the owner is CloudFront, Nginx/React/FastAPI on
-EC2, AgentCore Browser, Bedrock, the three existing DynamoDB tables and S3. This
-upgrade adds a shared production Strands graph and an EC2 background worker. Activate
-the worker and SES notifications using [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md).
-Those upgrade components have been implemented locally, not verified in the AWS account.
+The deployed foundation is CloudFront, Nginx/React/FastAPI on EC2, AgentCore Browser,
+Bedrock, the three existing DynamoDB tables, and S3 (see diagram above). This upgrade adds a
+shared production Strands graph and an EC2 background worker. Activate the worker and SES
+notifications using [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md). Those upgrade components
+have been implemented locally; SES delivery may still need account activation.
 
 ```mermaid
 flowchart LR
@@ -87,7 +102,7 @@ flowchart LR
     NGINX --> UI[React decision dashboard]
     NGINX --> API[FastAPI]
     API --> JOBS[(S3 durable scan jobs)]
-    TIMER[EC2 systemd timer: activate with upgrade] --> WORKER[Single background worker]
+    TIMER[EC2 systemd timer] --> WORKER[Single background worker]
     JOBS --> WORKER
     WORKER --> GRAPH[Strands graph]
     GRAPH --> COLLECT[Evidence collection tool]
@@ -99,9 +114,6 @@ flowchart LR
     VERIFY --> DB[(Existing Sites / Findings / Reviews)]
     COLLECT --> S3[(S3 snapshots and screenshots)]
     VERIFY --> S3
-    WORKER --> OUTBOX[(S3 deduplicated decision outbox)]
-    OUTBOX --> SES[SES: activate with upgrade]
-    SES --> USER
     API --> REVIEW[Atomic human review]
     REVIEW --> DB
     REVIEW --> ARTIFACT[(S3 approved guidance artifact)]
@@ -288,6 +300,7 @@ CDK output, packaged ZIP files, or local AgentCore state. These are excluded by 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+Copyright (c) 2026 Rudra Bedekar.
 
 ## Existing AWS storage and EC2 redeployment
 
