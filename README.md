@@ -2,314 +2,170 @@
 
 [Live HTTPS demo](https://d2g9z69nuvwc3l.cloudfront.net/) · [Submission packet](submission/SUBMISSION.md) · [MIT license](LICENSE)
 
-Civic Canary is a reviewer-controlled AI agent that monitors public-benefit portals for meaningful
-content and accessibility regressions. It captures a safe, read-only snapshot, compares it with an
-approved baseline, identifies nonprofit guidance affected by the change, and drafts a correction
-for a human reviewer.
-
-The repository contains a working local MVP and an AWS deployment hosted on Amazon EC2.
+Civic Canary is an autonomous AWS monitoring agent for public-benefit websites. It watches
+read-only pages for meaningful content and accessibility changes, verifies findings with
+evidence, and drafts guidance updates for a human reviewer—never publishing changes on its own.
 
 **License:** [MIT](LICENSE) · Copyright (c) 2026 Rudra Bedekar
 
-## Deployed AWS architecture
+## The problem
 
-The diagram below shows **only the architecture actually deployed** for Civic Canary
-(CloudFront → Nginx/React/FastAPI on EC2 → Strands → Bedrock + AgentCore Browser →
-DynamoDB/S3, with human approve/reject). Optional unused paths such as Lambda, API Gateway,
-EventBridge, and AgentCore Runtime are intentionally omitted.
+Nonprofit teams rely on public portals for eligibility rules, required documents, and
+application guidance. Those pages change without notice. Manual checking does not scale, and
+raw website diffs are noisy. Civic Canary surfaces only material, evidence-backed changes that
+affect people seeking benefits—and keeps a human in the loop before any guidance is updated.
+
+## Architecture
 
 ![Civic Canary deployed AWS architecture](docs/civic-canary-architecture.png)
 
-**Flow:** Reviewer → CloudFront → EC2 (UI/API/worker) → Strands → Bedrock / AgentCore Browser →
-public websites → S3 evidence + DynamoDB findings → human approve/reject → Reviews + approved
-artifact in S3.
+Civic Canary runs as an autonomous monitoring agent on AWS. A background worker periodically
+checks public-benefit websites, uses the Strands Agents SDK with Amazon Bedrock and AgentCore
+Browser to detect and verify meaningful changes, stores findings and evidence in DynamoDB and
+S3, and surfaces only actionable issues for human review.
 
-## Deployed AWS workflow
+**Core AWS services:** CloudFront, EC2, Strands Agents SDK, Amazon Bedrock, AgentCore Browser,
+DynamoDB, and S3.
 
-We built and deployed **Civic Canary**, an AWS-based monitoring system that detects meaningful
-changes on public-benefit websites and turns those changes into actionable findings for nonprofit
-teams. The application is hosted on **Amazon EC2** with a **FastAPI backend** and a **React
-frontend served through Nginx**, while **Amazon CloudFront** provides the public HTTPS endpoint.
-The monitored demo portal uses versioned pages such as V1 and V2 so the system can compare a known
-baseline against an updated version. The EC2 instance uses an **IAM role** to securely access AWS
-services without storing permanent access keys.
+**High-level flow:** Reviewer → CloudFront → EC2 (UI, API, and worker) → Strands → Bedrock /
+AgentCore Browser → public websites → S3 evidence and DynamoDB findings → human approve or
+reject → review record and approved artifact in S3.
 
-For automated website monitoring, Civic Canary uses **Amazon Bedrock AgentCore Browser** to launch
-browser sessions and capture the monitored pages. The browser visits the portal through the
-CloudFront HTTPS URL, captures page content and screenshots, and runs accessibility checks using
-**axe-core**. The system successfully detected both a new policy requirement and an accessibility
-issue: a newly required “Current benefit award letter” and a form field without an accessible
-label. The application also uses **Amazon Bedrock** and the project's AI/agent workflow to analyze
-detected changes, determine materiality and severity, map them to affected playbook sections, and
-generate proposed remediation text.
+## Autonomous agent workflow
 
-For persistent storage, the application connects to **Amazon DynamoDB** and **Amazon S3**.
-`CivicCanarySites` stores monitored-site configuration, `CivicCanaryFindings` stores structured
-findings, and `CivicCanaryReviews` supports the human approval/rejection workflow. **Amazon S3**
-stores the nonprofit playbook, scan records, baselines, snapshots, screenshots, evidence, and
-AgentCore Browser recordings. We verified that successful scans return `200 OK`, AgentCore Browser
-sessions are running, findings are written to DynamoDB, and supporting evidence is stored in S3.
-This provides an end-to-end AWS workflow:
+1. **Schedule** — An EC2 background worker checks which monitored sites are due.
+2. **Capture** — AgentCore Browser opens the allow-listed HTTPS pages, collects content,
+   screenshots, and accessibility signals.
+3. **Analyze** — The Strands Agents SDK runs a bounded graph on Amazon Bedrock: collect
+   evidence, classify relevant changes, draft a reviewer packet, and verify claims against
+   captured sources.
+4. **Persist** — Baselines, snapshots, screenshots, and scan records go to S3. Site config,
+   findings, and review state go to DynamoDB.
+5. **Review** — Only actionable findings appear in the dashboard for approve or reject.
 
-**Website monitoring → browser capture → AI analysis → evidence storage → structured findings →
-human review.**
+## Human-in-the-loop review
+
+Civic Canary drafts corrections; it does not edit public websites.
+
+- Reviewers see what changed, before/after evidence, impact, severity, and proposed guidance.
+- **Approve** writes an audit record and a downloadable Markdown artifact in S3.
+- **Reject** records the decision without publishing anything.
+- Scans, demo controls, and decisions require a reviewer token.
 
 ## Demo scenario
 
-The included River County benefits portal has two deterministic versions:
+The included River County benefits portal has two versions:
 
-- **V1** is the trusted baseline.
-- **V2** adds a required benefit-award letter, breaks the Spanish guidance link, and removes a form
-  label.
-- Unrelated styling changes are intentionally ignored.
+- **V1** — trusted baseline
+- **V2** — adds a required award letter, breaks Spanish guidance, and removes a form label
+- Cosmetic styling changes are ignored
 
-A reviewer can switch the demo version, start a scan, inspect evidence and graph timings, and
-approve or reject a proposed guidance patch. Approval creates a separate Markdown artifact; Civic
-Canary never edits the source portal.
+Reviewers can switch versions, run a scan, inspect evidence, and approve or reject a proposed
+patch.
 
-## Features
+## What it does
 
-- Bounded Strands workflow with typed Pydantic contracts
-- Deterministic semantic and structural comparison before model review
-- Accessibility checks for broken links, missing labels, language metadata, and axe-core findings
-- Evidence-backed mapping from portal changes to nonprofit playbook sections
-- Reviewer-token protection for scans, demo controls, and decisions
-- Run idempotency and finding deduplication
-- Local fixture browser and managed AgentCore Browser adapters
-- S3 evidence, DynamoDB records, CloudWatch tracing, and scheduled scans on AWS
-- Read-only URL allow-listing with cross-host navigation and write-request blocking
+- Monitors public HTTPS pages with a bounded, objective-guided page set
+- Detects material content and accessibility regressions with evidence quotations
+- Maps changes to nonprofit guidance sections and drafts remediation text
+- Deduplicates findings and supports scheduled background scans on AWS
+- Enforces read-only allow-lists (no login, no form submit, no off-host crawl)
 
 ## Safety boundaries
 
-Civic Canary does not:
+Civic Canary does **not**:
 
-- log in to portals or bypass CAPTCHA challenges;
-- enter or collect personal information;
-- upload files, submit applications, or make eligibility decisions;
-- navigate outside a target's exact host allow-list;
-- publish corrections without human approval.
+- log in, bypass CAPTCHA, or collect personal information
+- upload files, submit applications, or make eligibility decisions
+- navigate outside a target’s host allow-list
+- publish corrections without human approval
 
-## Deployed architecture and monitoring upgrade
+## Quick start (local)
 
-The deployed foundation is CloudFront, Nginx/React/FastAPI on EC2, AgentCore Browser,
-Bedrock, the three existing DynamoDB tables, and S3 (see diagram above). This upgrade adds a
-shared production Strands graph and an EC2 background worker. Activate the worker and SES
-notifications using [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md). Those upgrade components
-have been implemented locally; SES delivery may still need account activation.
-
-```mermaid
-flowchart LR
-    USER[Nonprofit reviewer] --> CF[CloudFront HTTPS]
-    CF --> NGINX[Nginx on EC2]
-    NGINX --> UI[React decision dashboard]
-    NGINX --> API[FastAPI]
-    API --> JOBS[(S3 durable scan jobs)]
-    TIMER[EC2 systemd timer] --> WORKER[Single background worker]
-    JOBS --> WORKER
-    WORKER --> GRAPH[Strands graph]
-    GRAPH --> COLLECT[Evidence collection tool]
-    COLLECT --> BROWSER[AgentCore Browser]
-    GRAPH --> CLASSIFY[Change and relevance analysis]
-    CLASSIFY --> DRAFT[Reviewer packet draft]
-    DRAFT --> VERIFY[Grounding verification]
-    GRAPH --> BEDROCK[Amazon Bedrock]
-    VERIFY --> DB[(Existing Sites / Findings / Reviews)]
-    COLLECT --> S3[(S3 snapshots and screenshots)]
-    VERIFY --> S3
-    API --> REVIEW[Atomic human review]
-    REVIEW --> DB
-    REVIEW --> ARTIFACT[(S3 approved guidance artifact)]
-```
-
-Production scans always execute `agent/civic_canary/reasoning.py`. The graph owns the
-browser collection tool, classifies objective-relevant changes, drafts a grounded
-packet, and verifies its claims. Exact evidence quotations and current-guidance quotes
-are validated before saving findings. The UI displays that validated proposed patch.
-Model/browser failure records a failed run; there is no production deterministic bypass.
-The deterministic V1/V2 fixture engine remains available in local mode.
-
-**Optional architecture:** EventBridge, Lambda, API Gateway and AgentCore Runtime
-remain in the repository as an alternative deployment. They are not represented as
-active EC2 components. The optional Runtime entrypoint now shares the production scan
-service. Do not deploy both scheduling paths without designing cross-worker locking.
-
-## Add a website and review a decision
-
-1. Enter your reviewer token and choose **Connect / refresh**.
-2. Choose **Add Website**. Supply its HTTPS URL, name, objective, category, frequency,
-   and optional guidance. The exact submitted page is monitored, not an unlimited crawl.
-3. The background worker runs AgentCore Browser and Strands, stores the first baseline,
-   and recommends headings based on captured evidence. Refresh to see setup progress.
-4. Accept or edit the sections and choose **Confirm monitoring**.
-5. Close the dashboard. The EC2 timer checks each site's due time. No material change
-   means no notification. A new actionable finding creates a deduplicated outbox event.
-6. Open the authenticated decision link. Review what changed, before/after evidence,
-   impact, affected people, current/proposed guidance, severity and agent confidence.
-7. Approve or reject with notes. Approval produces a downloadable Markdown artifact;
-   it never edits a public website automatically. The audit record retains the original
-   recommendation, evidence references, timestamp, reviewer identity and run ID.
-
-Run detail shows the reasoning engine, model ID, graph node timings and notification
-status. Browser session logs include that same run ID. Agent confidence is self-assessed,
-not calibrated accuracy. All AWS-mode data/evidence reads require the reviewer token.
-
-## Evaluation and submission evidence
+**Requirements:** Python 3.13+, [`uv`](https://docs.astral.sh/uv/), Node.js 20+
 
 ```bash
-uv run python -m scripts.evaluate --output evaluation-results.json
-# Optional: uses real Bedrock calls against fixed HTML cases and incurs AWS usage.
-uv run python -m scripts.evaluate --live-model --output live-evaluation-results.json
-```
-
-The offline suite checks two different page structures, meaningful/irrelevant/no-change
-content, ambiguous changes, deduplication, SSRF rejection, model/browser failures,
-notification behavior and atomic review. It also exercises the actual Strands SDK graph
-with a mocked model transport. Offline pass rates are contract checks, not model accuracy
-or live AWS uptime. Real-model accuracy and human review time remain unmeasured until
-those evaluations are run. Follow [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md) before submission.
-
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `agent/` | Strands graph, comparison engine, browser adapters, schemas, and fixtures |
-| `services/` | FastAPI control plane, scan worker, persistence, security, and observability |
-| `web/` | React reviewer dashboard and deterministic portal fixtures |
-| `infra/` | AWS CDK stack and AgentCore runtime policy |
-| `agentcore/` | AgentCore project configuration |
-| `scripts/` | Build, seed, deploy, and runtime-connection helpers |
-| `tests/` | API, workflow, safety, and resilience tests |
-| `AWS_DEPLOYMENT.md` | Complete deployment-owner handoff |
-
-## Local quick start
-
-Requirements:
-
-- Python 3.13 or 3.14
-- [`uv`](https://docs.astral.sh/uv/)
-- Node.js 20, 22, or 24 and npm
-
-Install dependencies:
-
-```bash
-uv sync --extra dev --extra infra
+uv sync --extra dev
 npm --prefix web install
 cp .env.example .env
-```
 
-Start the API:
-
-```bash
 export REVIEW_TOKEN=review-demo
 uv run uvicorn services.control_api.app:app --reload --port 8000
 ```
 
-Start the reviewer UI in another terminal:
+In another terminal:
 
 ```bash
 npm --prefix web run dev
 ```
 
-Open `http://localhost:5173`, enter `review-demo`, switch the portal to V2, and choose **Run
-scan**. The API is proxied from Vite to `http://localhost:8000`.
+Open `http://localhost:5173`, enter `review-demo`, switch the portal to V2, and run a scan.
 
-For a command-line demonstration:
+CLI demo:
 
 ```bash
-uv run civic-canary --version v1
-uv run civic-canary --version v2
+uv run civic-canary --version v1   # expect no findings
+uv run civic-canary --version v2   # expect material + accessibility findings
 ```
 
-V1 should produce no findings. V2 should detect the document requirement, broken Spanish link,
-and unlabeled field.
-
-## Run with Amazon Bedrock AgentCore Browser
-
-To run Civic Canary using the managed Amazon Bedrock AgentCore Browser rather than the local fixture browser, create or update your local `.env` file with:
+### AgentCore Browser (optional local)
 
 ```bash
 AWS_REGION=us-east-1
 BROWSER_MODE=agentcore
-AGENTCORE_BROWSER_ID=<their-browser-tool-id>
-BEDROCK_MODEL_ID=<their-bedrock-model-or-inference-profile-id>
+AGENTCORE_BROWSER_ID=<browser-id>
+BEDROCK_MODEL_ID=<model-or-inference-profile-id>
 ```
-
-AWS credentials should come from the normal AWS credential chain / IAM role (such as `aws sso login` or environment credentials) and must not be committed to GitHub.
-
-Run the scan locally in AgentCore mode:
 
 ```bash
 uv run civic-canary --version v2 --browser-mode agentcore
 ```
 
-When `BROWSER_MODE=agentcore` is set in `.env`, `uv run civic-canary --version v2` automatically connects to the configured AgentCore Browser tool.
+Use the standard AWS credential chain or an IAM role. Never commit credentials or `.env`.
 
+## Add a website (AWS deployment)
 
-## Tests and quality checks
+1. Connect with your reviewer token.
+2. Add a public HTTPS URL, name, monitoring objective, and scan frequency.
+3. Wait for baseline inspection (AgentCore Browser + Strands).
+4. Confirm or edit the discovered pages and sections to monitor.
+5. On later runs, the worker revisits those pages and opens findings only when material
+   changes are verified.
+6. Approve or reject each finding; approval produces a downloadable guidance artifact.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `agent/` | Strands workflow, browser adapters, schemas, fixtures |
+| `services/` | FastAPI control plane, worker, storage, security |
+| `web/` | React reviewer dashboard |
+| `docs/` | Architecture diagram and deployment notes |
+| `infra/` | Optional CDK definitions |
+| `tests/` | API, workflow, and safety tests |
+
+## Technical notes
+
+Detailed deployment, IAM, storage layout, EC2 worker activation, evaluation, and optional CDK
+paths live outside this overview:
+
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) — deployment index
+- [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md) — EC2 worker and storage upgrade
+- [EXISTING_AWS_STORAGE.md](EXISTING_AWS_STORAGE.md) — existing DynamoDB/S3 layout
+- [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md) — optional CDK handoff
+- [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md) — demo and submission checklist
 
 ```bash
+# Tests
 uv run --extra dev pytest
 uv run --extra dev ruff check agent services tests scripts infra
-npm --prefix web test
-npm --prefix web run lint
-npm --prefix web run build
+npm --prefix web test && npm --prefix web run lint && npm --prefix web run build
+
+# Offline evaluation harness
+uv run python -m scripts.evaluate --output evaluation-results.json
 ```
-
-The tests cover baseline matching, all three demo regressions, allow-list enforcement, write-request
-blocking, protected actions, approval rollback, asynchronous dispatch, idempotency, and explicit
-failure handling.
-
-## API
-
-Reads (public in local fixture mode; reviewer-token protected in AWS mode):
-
-- `GET /api/health`
-- `GET /api/targets`
-- `GET /api/runs`
-- `GET /api/runs/{run_id}`
-- `GET /api/findings`
-- `GET /api/findings/{finding_id}`
-
-Requests requiring `X-Review-Token`:
-
-- `POST /api/runs`
-- `POST /api/demo/version`
-- `POST /api/findings/{finding_id}/decision`
-
-## AWS deployment
-
-For the existing CivicCanarySites, CivicCanaryFindings, CivicCanaryReviews tables and
-civic-canary bucket, follow [Existing AWS storage](EXISTING_AWS_STORAGE.md).
-That path needs no new tables or CDK deployment.
-
-The optional CDK deployment targets `us-east-1`. Its Lambda/API Gateway/Runtime path is
-separate from the EC2 deployment described above.
-
-For the optional CDK deployment, follow [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md). It includes the required
-permissions, model and quota checks, reviewer-token setup, estimated costs, deployment commands,
-acceptance tests, troubleshooting, and complete cleanup instructions.
-
-Never commit `.env`, reviewer tokens, token digests, AWS credentials, generated deployment targets,
-CDK output, packaged ZIP files, or local AgentCore state. These are excluded by `.gitignore`.
-
-## Contributing
-
-1. Create a branch from `main`.
-2. Keep portal access read-only and preserve the safety boundaries above.
-3. Add tests for every behavior change.
-4. Run all Python and web checks before opening a pull request.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).  
 Copyright (c) 2026 Rudra Bedekar.
-
-## Existing AWS storage and EC2 redeployment
-
-Use [DEPLOYMENT_UPGRADE.md](DEPLOYMENT_UPGRADE.md) for the authoritative EC2 activation
-steps, environment variables, role permissions, SES setup, timer installation, history
-backfill and migration limits. No new DynamoDB tables are required. The existing
-storage adapter remains compatible; new API decisions use atomic finding/review writes.
-
-Before updating any previously deployed CDK stack, retain its old storage resources:
-legacy definitions used destructive removal policies. EC2 activation does not require CDK.
