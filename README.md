@@ -1,5 +1,7 @@
 # Civic Canary
 
+[Live HTTPS demo](https://d2g9z69nuvwc3l.cloudfront.net/) · [Submission packet](submission/SUBMISSION.md) · [MIT license](LICENSE)
+
 Civic Canary is a reviewer-controlled AI agent that monitors public-benefit portals for meaningful
 content and accessibility regressions. It captures a safe, read-only snapshot, compares it with an
 approved baseline, identifies nonprofit guidance affected by the change, and drafts a correction

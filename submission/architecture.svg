@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+ <title id="title">Civic Canary — EC2 architecture</title>
+ <desc id="desc">Reviewer uses CloudFront and EC2 FastAPI. S3 jobs feed a worker running a Strands collect, classify, draft, verify graph with Bedrock and AgentCore Browser. Evidence lives in S3, records in DynamoDB. Human approval creates a separate artifact. Timer and SES activation need deployment verification.</desc>
+ <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#71b9be"/></marker>
+ <style>text{font-family:Arial,sans-serif;fill:#edf5f6}.h{font-size:25px;font-weight:bold}.b{font-size:20px;fill:#bed1d6}.small{font-size:18px;fill:#bed1d6}.box{fill:#19313f;stroke:#426574;stroke-width:2;rx:16}.line{fill:none;stroke:#71b9be;stroke-width:3;marker-end:url(#arrow)}.pending{stroke-dasharray:8 6}</style></defs>
+ <rect width="1600" height="1000" fill="#0c1c27"/>
+ <text x="60" y="64" font-size="40" font-weight="bold">CIVIC CANARY</text>
+ <text x="60" y="104" class="b">Public-service changes → grounded evidence → human decisions</text>
+ <text x="60" y="140" class="small">EC2 implementation architecture • Component activation is not a claim of verified live execution</text>
+ <rect class="box" x="60" y="185" width="275" height="115"/><text class="h" x="85" y="227">Nonprofit reviewer</text><text class="b" x="85" y="266">Token-protected access</text>
+ <rect class="box" x="400" y="185" width="275" height="115"/><text class="h" x="425" y="227">CloudFront</text><text class="b" x="425" y="266">Public HTTPS endpoint</text>
+ <rect class="box" x="740" y="185" width="340" height="115"/><text class="h" x="765" y="227">Amazon EC2 + Nginx</text><text class="b" x="765" y="266">React UI / FastAPI control API</text>
+ <rect class="box" x="1145" y="185" width="395" height="115"/><text class="h" x="1170" y="227">S3 durable jobs + worker</text><text class="b" x="1170" y="266">Manual and recurring scan requests</text>
+ <path class="line" d="M335 242H400 M675 242H740 M1080 242H1145"/>
+ <rect class="box pending" x="1145" y="335" width="395" height="90"/><text class="h" x="1170" y="371">systemd timer</text><text class="small" x="1170" y="403">Verify activation; one worker only</text><path class="line" d="M1340 335V300"/>
+ <rect x="60" y="345" width="1020" height="220" rx="20" fill="#102e35" stroke="#71b9be" stroke-width="2"/>
+ <text class="h" x="85" y="388">STRANDS AGENTS SDK • GraphBuilder</text>
+ <text class="b" x="90" y="449">Collect</text><text class="b" x="330" y="449">Classify</text><text class="b" x="570" y="449">Draft</text><text class="b" x="810" y="449">Verify</text>
+ <path class="line" d="M190 443H300 M430 443H540 M670 443H780"/>
+ <text class="small" x="85" y="502">Pydantic contracts • exact source quotations • no unsupported finding on failure</text>
+ <text class="small" x="85" y="539">Grounded proposed guidance, severity, impact, and evidence references</text>
+ <path class="line" d="M1145 280H1110V455H1080"/>
+ <rect class="box" x="60" y="620" width="320" height="125"/><text class="h" x="85" y="660">AgentCore Browser</text><text class="b" x="85" y="696">Allow-listed public pages</text><text class="small" x="85" y="727">Read-only + accessibility checks</text>
+ <rect class="box" x="420" y="620" width="290" height="125"/><text class="h" x="445" y="660">Amazon Bedrock</text><text class="b" x="445" y="696">Model reasoning</text><text class="small" x="445" y="727">Classify / draft / verify</text>
+ <rect class="box" x="750" y="620" width="365" height="125"/><text class="h" x="775" y="660">Amazon S3</text><text class="b" x="775" y="696">Baselines, scans, screenshots</text><text class="small" x="775" y="727">Playbooks + approved artifacts</text>
+ <rect class="box" x="1155" y="620" width="385" height="125"/><text class="h" x="1180" y="660">Amazon DynamoDB</text><text class="b" x="1180" y="696">Sites / Findings / Reviews</text><text class="small" x="1180" y="727">Atomic review transitions</text>
+ <path class="line" d="M220 565V620 M565 565V620 M930 565V620 M1080 515H1340V620"/>
+ <path class="line" d="M1340 745V775H400V805"/>
+ <rect class="box" x="60" y="805" width="680" height="115"/><text class="h" x="85" y="847">Human decision gate</text><text class="b" x="85" y="882">Approve → separate draft • Reject → retained audit record</text>
+ <rect class="box pending" x="795" y="805" width="745" height="115"/><text class="h" x="820" y="847">Decision outbox → SES → reviewer</text><text class="b" x="820" y="882">Verify sender, permissions, timer, and actual delivery before demo</text>
+ <text class="small" x="60" y="969">No application submissions. No eligibility decisions. No automatic public-site edits. IAM instance role; correlated run IDs.</text>
+</svg>
